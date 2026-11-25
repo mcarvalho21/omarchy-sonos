@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "mc.sonos",
   "name": "Sonos",
-  "version": "3.2.0",
+  "version": "3.2.1",
   "author": "mc",
   "license": "MIT",
   "description": "Sonos now playing, rooms, playlists and queue",

@@ -22,6 +22,11 @@ Item {
   signal queueReceived(var items)
   signal commandCompleted()
 
+  // Lists that cross a `var` signal arrive as Qt sequences, which fail Array.isArray().
+  function isList(value) {
+    return value !== null && value !== undefined && typeof value === "object" && typeof value.length === "number"
+  }
+
   property var _cmdQueue: []
   property var _pendingVolumePayload: null
 
@@ -185,7 +190,7 @@ Item {
     socketPath: root.socketPath
     onResponse: function(data) {
       root.libraryLoading = false
-      if (data && data.ok && Array.isArray(data.items)) root.libraryReceived(data.items)
+      if (data && data.ok && root.isList(data.items)) root.libraryReceived(data.items)
     }
     onFailed: root.libraryLoading = false
   }
@@ -195,7 +200,7 @@ Item {
     socketPath: root.socketPath
     onResponse: function(data) {
       root.queueLoading = false
-      if (data && data.ok && Array.isArray(data.items)) root.queueReceived(data.items)
+      if (data && data.ok && root.isList(data.items)) root.queueReceived(data.items)
     }
     onFailed: root.queueLoading = false
   }

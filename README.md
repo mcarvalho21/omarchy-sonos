@@ -1,5 +1,7 @@
 # Sonos (`mc.sonos`)
 
+![Sonos panel: selecting a grouped room, the room volumes following the group volume, and the Playlists drawer](docs/demo.gif)
+
 Control Sonos speakers on your local network from the Omarchy bar.
 
 The bar shows the playing track. Click it to open a now-playing panel with
@@ -42,6 +44,13 @@ Set these on the `mc.sonos` entry in `~/.config/omarchy/shell.json`:
 | `showArtistInBar` | `true` | Add the artist after the title |
 | `preferredRoom` | `""` | Room to pick first (blank = whichever is playing) |
 | `volumeStep` | `4` | Volume change per scroll or key step, 1–15 |
+
+## Demo GIF
+
+`scripts/record-demo.sh [room]` regenerates `docs/demo.gif`. It switches to an
+empty workspace, drives the panel with simulated keys, nudges the room's group
+volume up and back, and restores everything afterwards. Needs `wtype` and
+`wf-recorder` (`omarchy pkg add wtype wf-recorder`).
 
 ## Testing
 
