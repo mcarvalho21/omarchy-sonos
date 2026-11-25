@@ -1,0 +1,74 @@
+{
+  "schemaVersion": 1,
+  "id": "mc.sonos",
+  "name": "Sonos",
+  "version": "3.2.0",
+  "author": "mc",
+  "license": "MIT",
+  "description": "Sonos now playing, rooms, playlists and queue",
+  "keywords": [
+    "sonos",
+    "media",
+    "mpris",
+    "now-playing",
+    "audio",
+    "multiroom"
+  ],
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Sonos",
+    "description": "Sonos now playing, rooms, playlists and queue",
+    "category": "Media",
+    "aliases": [
+      "sonos"
+    ],
+    "allowMultiple": false,
+    "defaults": {
+      "showTrackInBar": true,
+      "showArtistInBar": true,
+      "preferredRoom": "",
+      "volumeStep": 4
+    },
+    "schema": [
+      {
+        "key": "showTrackInBar",
+        "type": "boolean",
+        "label": "Show track title in bar",
+        "description": "Display the playing Sonos track next to the icon in the bar.",
+        "defaultValue": true
+      },
+      {
+        "key": "showArtistInBar",
+        "type": "boolean",
+        "label": "Show artist in bar",
+        "description": "Append the artist name after the track title in the bar.",
+        "defaultValue": true
+      },
+      {
+        "key": "preferredRoom",
+        "type": "string",
+        "label": "Default room",
+        "description": "Preferred Sonos room to select when opening the panel (blank = auto).",
+        "defaultValue": ""
+      },
+      {
+        "key": "volumeStep",
+        "type": "integer",
+        "label": "Volume step (%)",
+        "description": "Volume change per scroll tick or slider step.",
+        "min": 1,
+        "max": 15,
+        "step": 1,
+        "defaultValue": 4
+      }
+    ]
+  }
+}
