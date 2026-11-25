@@ -53,7 +53,11 @@ Panel {
   property string queueQuery: ""
   property var libraryItems: []
   property var queueItems: []
+  property string queueCoordUuid: ""
   property int livePositionSec: 0
+  property double lastSeekMs: 0
+  property double _lastStateAtMs: 0
+  property string _lastTrackKey: ""
   property real barWheelAccumulator: 0
 
   readonly property bool stateLoading: rpc.stateLoading
@@ -71,22 +75,31 @@ Panel {
   readonly property var speakersRows: Model.buildSpeakersRows(groups, speakers, activeGroup)
 
   // Grouped-room volumes, shown under the group slider while it is being set (like the Sonos app).
+  readonly property var groupsByUuid: Model.indexByKey(groups, "coord_uuid")
+  readonly property var speakersByUuid: Model.indexByKey(speakers, "uuid")
   readonly property var groupMembers: Model.groupMembers(activeGroup, speakers)
   readonly property bool isMultiRoomGroup: groupMembers.length > 1
-  // A string only changes when membership changes, so the room rows are not
-  // rebuilt (and a drag is not cut off) every time fresh state arrives.
+  // Stable string keys only change when topology/membership changes, so Repeater
+  // rows are not destroyed (and slider drags are not cut off) on every poll tick.
+  readonly property string groupKey: groups.map(function(g) { return g.coord_uuid }).join(",")
+  readonly property var groupUuids: groupKey === "" ? [] : groupKey.split(",")
+  readonly property string speakerKey: speakers.map(function(sp) { return sp.uuid }).join(",")
+  readonly property var speakerUuids: speakerKey === "" ? [] : speakerKey.split(",")
   readonly property string groupMemberKey: groupMembers.map(function(sp) { return sp.uuid }).join(",")
   readonly property var groupMemberUuids: groupMemberKey === "" ? [] : groupMemberKey.split(",")
 
+  function groupByUuid(uuid) {
+    return groupsByUuid[uuid] || null
+  }
+
   function speakerByUuid(uuid) {
-    for (var i = 0; i < speakers.length; i++)
-      if (speakers[i].uuid === uuid) return speakers[i]
-    return null
+    return speakersByUuid[uuid] || null
   }
   property bool memberVolumesShown: false
   property bool masterVolumeHovered: false
   property bool memberVolumesHovered: false
   property var memberVolumeBase: null
+  property var groupVolumePreview: ({})
   property var memberVolumePreview: ({})
   property double lastVolumeAdjustMs: 0
 
@@ -105,30 +118,44 @@ Panel {
     memberVolumePreview = ({})
   }
 
-  // Move the room sliders along with the group slider until the speakers report real values.
+  function groupVolume(group) {
+    if (!group) return 0
+    var preview = groupVolumePreview[group.coord_uuid]
+    return preview !== undefined ? preview : (group.group_volume || 0)
+  }
+
+  // Move the sliders optimistically until the speakers report real values.
   function previewGroupVolume(volume) {
     lastVolumeAdjustMs = Date.now()
     memberVolumeSettle.restart()
-    if (!isMultiRoomGroup || !activeGroup) return
+    if (!activeGroup) return
+    var target = Math.max(0, Math.min(100, Math.round(volume)))
+    var prevBaseGroup = groupVolume(activeGroup)
+    var nextGroup = {}
+    for (var gk in groupVolumePreview) nextGroup[gk] = groupVolumePreview[gk]
+    nextGroup[activeGroup.coord_uuid] = target
+    groupVolumePreview = nextGroup
+    if (!isMultiRoomGroup) return
     if (!memberVolumeBase) {
       var vols = {}
       for (var i = 0; i < groupMembers.length; i++)
         vols[groupMembers[i].uuid] = memberVolume(groupMembers[i])
-      memberVolumeBase = { group: activeGroup.group_volume || 0, volumes: vols }
+      memberVolumeBase = { group: prevBaseGroup, volumes: vols }
     }
-    memberVolumePreview = Model.predictMemberVolumes(memberVolumeBase.volumes, memberVolumeBase.group, volume)
+    memberVolumePreview = Model.predictMemberVolumes(memberVolumeBase.volumes, memberVolumeBase.group, target)
     revealMemberVolumes()
   }
 
-  function previewMemberVolume(speaker, volume) {
+  function previewMemberVolume(speaker, volume, reveal) {
+    if (!speaker) return
     lastVolumeAdjustMs = Date.now()
     memberVolumeSettle.restart()
     memberVolumeBase = null
     var next = {}
     for (var k in memberVolumePreview) next[k] = memberVolumePreview[k]
-    next[speaker.uuid] = Math.round(volume)
+    next[speaker.uuid] = Math.max(0, Math.min(100, Math.round(volume)))
     memberVolumePreview = next
-    revealMemberVolumes()
+    if (reveal !== false) revealMemberVolumes()
   }
 
   function memberVolume(speaker) {
@@ -264,7 +291,7 @@ Panel {
       // row, h/l adjusts that slider (just like omarchy.audio). Otherwise h/l
       // seeks the current track.
       if (cursorActive && focusSection === "master" && activeGroup) {
-        var nextGroupVol = Math.max(0, Math.min(100, (activeGroup.group_volume || 0) + dx * volumeStep))
+        var nextGroupVol = Math.max(0, Math.min(100, groupVolume(activeGroup) + dx * volumeStep))
         previewGroupVolume(nextGroupVol)
         sendCommand({ cmd: "set_group_volume", coord_uuid: activeGroup.coord_uuid, volume: nextGroupVol })
         return
@@ -273,7 +300,8 @@ Panel {
           && selectedIndex >= 0 && selectedIndex < speakersRows.length) {
         var row = speakersRows[selectedIndex]
         if (row.kind === "speaker" && row.inGroup) {
-          var nextSpVol = Math.max(0, Math.min(100, (row.speaker.volume || 0) + dx * volumeStep))
+          var nextSpVol = Math.max(0, Math.min(100, memberVolume(row.speaker) + dx * volumeStep))
+          previewMemberVolume(row.speaker, nextSpVol, false)
           sendCommand({ cmd: "set_speaker_volume", speaker_uuid: row.speaker.uuid, volume: nextSpVol })
           return
         }
@@ -281,6 +309,7 @@ Panel {
       if (activeGroup && (activeGroup.duration_sec || 0) > 0) {
         var dur = activeGroup.duration_sec || 0
         var nextSec = Math.max(0, Math.min(dur, livePositionSec + dx * seekStep))
+        lastSeekMs = Date.now()
         livePositionSec = nextSec
         sendCommand({ cmd: "seek", coord_uuid: activeGroup.coord_uuid, seconds: nextSec })
       }
@@ -450,6 +479,7 @@ Panel {
       postCommandRefresh.stop()
       rpc.flushPendingVolume()
       hideMemberVolumes()
+      groupVolumePreview = ({})
       expanded = false
       activeTab = "speakers"
     }
@@ -477,10 +507,9 @@ Panel {
 
   onSelectedCoordUuidChanged: {
     hideMemberVolumes()
-    if (opened && expanded && activeTab === "queue") fetchQueue()
-  }
-
-  onQueueLimitChanged: {
+    groupVolumePreview = ({})
+    queueCoordUuid = ""
+    queueItems = []
     if (opened && expanded && activeTab === "queue") fetchQueue()
   }
 
@@ -490,30 +519,47 @@ Panel {
   SonosRpc {
     id: rpc
 
-    // Values crossing a `var` signal arrive as Qt sequences (not JS Arrays), so
-    // Array.isArray() fails on them. Round-trip through JSON to get plain JS data.
-    onStateReceived: function(data) {
-      data = Model.toPlain(data)
+    onStateReceived: function(rawJson) {
+      var data = null
+      try { data = JSON.parse(rawJson) } catch (e) { return }
+      if (!data || !data.ok) return
       if (Array.isArray(data.groups)) root.groups = data.groups
       if (Array.isArray(data.speakers)) root.speakers = data.speakers
       // Real values replace the estimate once no change is in flight.
       if (Date.now() - root.lastVolumeAdjustMs > 1000 && !memberVolumeSettle.running) {
         root.memberVolumeBase = null
+        root.groupVolumePreview = ({})
         root.memberVolumePreview = ({})
       }
-      if (root.activeGroup) root.livePositionSec = root.activeGroup.position_sec || 0
+      if (root.activeGroup) {
+        var trackKey = root.activeGroup.coord_uuid + "|" + (root.activeGroup.track_num || 0) + "|" + (root.activeGroup.title || "")
+        var trackChanged = trackKey !== root._lastTrackKey
+        root._lastTrackKey = trackKey
+        if (trackChanged || (Date.now() - root.lastSeekMs > 1000))
+          root.livePositionSec = root.activeGroup.position_sec || 0
+      }
+      root._lastStateAtMs = Date.now()
       root.clampCursor()
-      if (root.opened && root.expanded && root.activeTab === "queue" && root.queueItems.length === 0 && root.activeGroup)
+      if (root.opened && root.expanded && root.activeTab === "queue" && root.activeGroup
+          && root.queueCoordUuid !== root.activeGroup.coord_uuid)
         root.fetchQueue()
     }
 
-    onLibraryReceived: function(items) {
-      root.libraryItems = Model.toPlain(items) || []
+    onLibraryReceived: function(rawJson) {
+      var data = null
+      try { data = JSON.parse(rawJson) } catch (e) { return }
+      if (!data || !data.ok || !Array.isArray(data.items)) return
+      root.libraryItems = data.items
       root.clampCursor()
     }
 
-    onQueueReceived: function(items) {
-      root.queueItems = Model.toPlain(items) || []
+    onQueueReceived: function(rawJson) {
+      var data = null
+      try { data = JSON.parse(rawJson) } catch (e) { return }
+      if (!data || !data.ok || !Array.isArray(data.items)) return
+      if (data.coord_uuid && root.activeGroup && data.coord_uuid !== root.activeGroup.coord_uuid) return
+      root.queueItems = data.items
+      root.queueCoordUuid = data.coord_uuid || (root.activeGroup ? root.activeGroup.coord_uuid : "")
       root.clampCursor()
     }
   }
@@ -524,7 +570,10 @@ Panel {
     interval: root.pollIntervalSec * 1000
     running: root.opened
     repeat: true
-    onTriggered: root.fetchState(false)
+    onTriggered: {
+      if (Date.now() - root._lastStateAtMs >= (root.pollIntervalSec * 1000 - 300))
+        root.fetchState(false)
+    }
   }
 
   // Hide the room volumes a few seconds after the last change, unless the pointer is on them.
@@ -686,7 +735,8 @@ Panel {
         if (res.steps === 0) return
         var step = res.steps * root.volumeStep
         if (root.opened && root.activeGroup) {
-          var nextVol = Math.max(0, Math.min(100, (root.activeGroup.group_volume || 0) + step))
+          var nextVol = Math.max(0, Math.min(100, root.groupVolume(root.activeGroup) + step))
+          root.previewGroupVolume(nextVol)
           root.queueVolumeChange({ cmd: "set_group_volume", coord_uuid: root.activeGroup.coord_uuid, volume: nextVol })
         } else if (root.activeMprisPlayer && root.activeMprisPlayer.volumeSupported) {
           var cur = Number(root.activeMprisPlayer.volume) || 0
@@ -1041,6 +1091,7 @@ Panel {
                 fillColor: root.accent
                 onReleased: function(v) {
                   if (!root.activeGroup) return
+                  root.lastSeekMs = Date.now()
                   root.livePositionSec = Math.round(v)
                   root.sendCommand({ cmd: "seek", coord_uuid: root.activeGroup.coord_uuid, seconds: Math.round(v) })
                 }
@@ -1165,7 +1216,7 @@ Panel {
 
                 Button {
                   Layout.alignment: Qt.AlignVCenter
-                  iconText: Model.volumeIcon(root.activeGroup ? root.activeGroup.group_volume : 0, root.activeGroup && root.activeGroup.group_muted)
+                  iconText: Model.volumeIcon(root.groupVolume(root.activeGroup), root.activeGroup && root.activeGroup.group_muted)
                   bordered: false
                   foreground: root.activeGroup && root.activeGroup.group_muted ? root.dimmer : root.foreground
                   horizontalPadding: Style.space(4)
@@ -1191,7 +1242,7 @@ Panel {
                   maximum: 100
                   step: root.volumeStep
                   integer: true
-                  value: root.activeGroup ? (root.activeGroup.group_volume || 0) : 0
+                  value: root.groupVolume(root.activeGroup)
                   opacity: root.activeGroup && root.activeGroup.group_muted ? 0.5 : 1.0
                   onDraggingChanged: if (dragging) root.revealMemberVolumes()
                   onMoved: function(v) {

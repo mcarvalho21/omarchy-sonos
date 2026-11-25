@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import ctypes
+import fcntl
 import html
+import http.client
 import ipaddress
 import json
 import os
@@ -29,11 +31,9 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 MPRIS_PATH = "/org/mpris/MediaPlayer2"
 MPRIS_IFACE = "org.mpris.MediaPlayer2"
@@ -46,14 +46,18 @@ NS_UPNP = "{urn:schemas-upnp-org:metadata-1-0/upnp/}"
 NS_R = "{urn:schemas-rinconnetworks-com:metadata-1-0/}"
 
 MAX_HTTP_BYTES = 1024 * 1024
+MAX_DIDL_METADATA_BYTES = 16384
+MAX_IDLE_CONNS_PER_IP = 6
 HTTP_TIMEOUT = 2.5
 DISCOVERY_INTERVAL = 60.0
+FORCE_DISCOVERY_MIN_INTERVAL = 5.0
 TOPOLOGY_ACTIVE_INTERVAL = 20.0
 TOPOLOGY_IDLE_INTERVAL = 60.0
 POLL_ACTIVE_INTERVAL = 2.0
 POLL_IDLE_INTERVAL = 30.0
 IDLE_SWEEP_INTERVAL = 30.0
 LIBRARY_CACHE_TTL = 45.0
+SERVICE_CACHE_RETRY_INTERVAL = 60.0
 
 
 def runtime_dir() -> str:
@@ -66,6 +70,10 @@ def legacy_state_file_path() -> str:
 
 def socket_file_path() -> str:
     return os.path.join(runtime_dir(), "mc-sonos.sock")
+
+
+def lock_file_path() -> str:
+    return os.path.join(runtime_dir(), "mc-sonos.lock")
 
 
 def set_parent_death_signal() -> None:
@@ -118,6 +126,87 @@ def compute_poll_interval(any_playing: bool, has_speakers: bool) -> float:
     return POLL_ACTIVE_INTERVAL
 
 
+class _HttpPool:
+    """Thread-safe HTTP/1.1 keep-alive connection pool keyed by speaker IP."""
+
+    def __init__(self, max_per_ip: int = MAX_IDLE_CONNS_PER_IP) -> None:
+        self._max_per_ip = max_per_ip
+        self._lock = threading.Lock()
+        self._idle: dict[str, list[http.client.HTTPConnection]] = {}
+
+    def _acquire(self, ip: str) -> tuple[http.client.HTTPConnection, bool]:
+        with self._lock:
+            bucket = self._idle.get(ip)
+            if bucket:
+                return bucket.pop(), True
+        return http.client.HTTPConnection(ip, 1400, timeout=HTTP_TIMEOUT), False
+
+    def _release(self, ip: str, conn: http.client.HTTPConnection) -> None:
+        with self._lock:
+            bucket = self._idle.setdefault(ip, [])
+            if len(bucket) < self._max_per_ip:
+                bucket.append(conn)
+                return
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def close_all(self) -> None:
+        with self._lock:
+            buckets = list(self._idle.values())
+            self._idle.clear()
+        for bucket in buckets:
+            for conn in bucket:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def post(self, ip: str, path: str, headers: dict[str, str], payload: bytes) -> str:
+        conn, reused = self._acquire(ip)
+        for attempt in range(2):
+            try:
+                conn.request("POST", path, body=payload, headers=headers)
+                resp = conn.getresponse()
+                raw = resp.read(MAX_HTTP_BYTES)
+                status = resp.status
+                reason = resp.reason
+                reusable = (not resp.will_close) and resp.isclosed() and status < 400
+            except (
+                http.client.HTTPException,
+                BrokenPipeError,
+                ConnectionResetError,
+                OSError,
+            ):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                # Retry once only when a reused keep-alive connection went stale.
+                if reused and attempt == 0:
+                    conn = http.client.HTTPConnection(ip, 1400, timeout=HTTP_TIMEOUT)
+                    reused = False
+                    continue
+                raise
+            if reusable:
+                self._release(ip, conn)
+            else:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if status >= 400:
+                raise http.client.HTTPException(
+                    f"HTTP {status} {reason} for http://{ip}:1400{path}"
+                )
+            return raw.decode("utf-8", "replace")
+        raise OSError("SOAP request failed")
+
+
+_HTTP_POOL = _HttpPool()
+
+
 def soap_call(ip: str, path: str, service: str, action: str, body: str = "") -> str:
     payload = (
         '<?xml version="1.0" encoding="utf-8"?>'
@@ -126,17 +215,13 @@ def soap_call(ip: str, path: str, service: str, action: str, body: str = "") -> 
         f'<s:Body><u:{action} xmlns:u="urn:schemas-upnp-org:service:{service}:1">'
         f"{body}</u:{action}></s:Body></s:Envelope>"
     ).encode("utf-8")
-    req = urllib.request.Request(
-        f"http://{ip}:1400{path}",
-        data=payload,
-        headers={
-            "Content-Type": 'text/xml; charset="utf-8"',
-            "SOAPACTION": f'"urn:schemas-upnp-org:service:{service}:1#{action}"',
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-        return resp.read(MAX_HTTP_BYTES).decode("utf-8", "replace")
+    headers = {
+        "Content-Type": 'text/xml; charset="utf-8"',
+        "SOAPACTION": f'"urn:schemas-upnp-org:service:{service}:1#{action}"',
+        "Connection": "keep-alive",
+        "Content-Length": str(len(payload)),
+    }
+    return _HTTP_POOL.post(ip, path, headers, payload)
 
 
 def discover_via_avahi() -> list[str]:
@@ -180,14 +265,20 @@ def discover_via_ssdp() -> list[str]:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     try:
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-        sock.settimeout(2.2)
         sock.sendto(msg, ("239.255.255.250", 1900))
         deadline = time.monotonic() + 2.5
-        while time.monotonic() < deadline:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
             try:
-                _, addr = sock.recvfrom(4096)
+                data, addr = sock.recvfrom(4096)
             except socket.timeout:
                 break
+            low = data.lower()
+            if b"sonos" not in low and b"zoneplayer" not in low:
+                continue
             ip = addr[0]
             if is_valid_private_ipv4(ip) and ip not in seen:
                 seen.add(ip)
@@ -265,7 +356,10 @@ class TrackState:
         return bool(self.title or self.artist)
 
 
+_SERVICE_NAMES_LOCK = threading.Lock()
 _SERVICE_NAMES_CACHE: dict[str, str] = {}
+_SERVICE_NAMES_FETCHED = False
+_SERVICE_NAMES_LAST_ATTEMPT = 0.0
 
 KNOWN_SERVICE_NAMES: dict[str, str] = {
     "9": "Spotify",
@@ -282,27 +376,42 @@ KNOWN_SERVICE_NAMES: dict[str, str] = {
 
 
 def fetch_music_services(ip: str) -> dict[str, str]:
-    global _SERVICE_NAMES_CACHE
-    if _SERVICE_NAMES_CACHE:
-        return _SERVICE_NAMES_CACHE
+    global _SERVICE_NAMES_CACHE, _SERVICE_NAMES_FETCHED, _SERVICE_NAMES_LAST_ATTEMPT
+    now = time.monotonic()
+    with _SERVICE_NAMES_LOCK:
+        if _SERVICE_NAMES_FETCHED and _SERVICE_NAMES_CACHE:
+            return dict(_SERVICE_NAMES_CACHE)
+        if not ip or (
+            _SERVICE_NAMES_LAST_ATTEMPT > 0.0
+            and (now - _SERVICE_NAMES_LAST_ATTEMPT) < SERVICE_CACHE_RETRY_INTERVAL
+        ):
+            return dict(_SERVICE_NAMES_CACHE or KNOWN_SERVICE_NAMES)
+        _SERVICE_NAMES_LAST_ATTEMPT = now
+
     result = dict(KNOWN_SERVICE_NAMES)
-    if ip:
-        try:
-            resp = soap_call(
-                ip, "/MusicServices/Control", "MusicServices", "ListAvailableServices"
-            )
-            desc = ET.fromstring(resp).findtext(".//AvailableServiceDescriptorList") or ""
-            if desc:
-                sroot = ET.fromstring(desc)
-                for el in sroot.findall(".//Service"):
-                    sid = el.attrib.get("Id")
-                    name = (el.attrib.get("Name") or "").strip()
-                    if sid and name:
-                        result[sid] = name
-        except Exception:
-            pass
-    _SERVICE_NAMES_CACHE = result
-    return result
+    fetched = False
+    try:
+        resp = soap_call(
+            ip, "/MusicServices/Control", "MusicServices", "ListAvailableServices"
+        )
+        desc = ET.fromstring(resp).findtext(".//AvailableServiceDescriptorList") or ""
+        if desc:
+            sroot = ET.fromstring(desc)
+            for el in sroot.findall(".//Service"):
+                sid = el.attrib.get("Id")
+                name = (el.attrib.get("Name") or "").strip()
+                if sid and name:
+                    result[sid] = name
+            fetched = True
+    except Exception:
+        pass
+
+    with _SERVICE_NAMES_LOCK:
+        if fetched:
+            _SERVICE_NAMES_CACHE = result
+            _SERVICE_NAMES_FETCHED = True
+            return dict(_SERVICE_NAMES_CACHE)
+        return dict(_SERVICE_NAMES_CACHE or KNOWN_SERVICE_NAMES)
 
 
 def source_icon_for(name: str) -> str:
@@ -446,6 +555,11 @@ def parse_zone_group_state(state_xml: str) -> tuple[list[ZoneGroup], list[Speake
                 coord_ip = mip
                 coord_name = name or mip
         if coord_ip and coord_uuid:
+            if coord_uuid in member_uuids:
+                cidx = member_uuids.index(coord_uuid)
+                if cidx > 0:
+                    member_uuids.insert(0, member_uuids.pop(cidx))
+                    member_names.insert(0, member_names.pop(cidx))
             groups.append(
                 ZoneGroup(
                     coord_uuid=coord_uuid,
@@ -518,97 +632,67 @@ def parse_didl_metadata(ip: str, meta_xml: str) -> tuple[str, str, str, str]:
     return title, artist, album, art
 
 
-def fetch_speaker_audio(ip: str) -> tuple[int, bool]:
-    vol = 0
-    muted = False
+def _parse_int_tag(xml_text: str | None, tag: str, min_val: int = 0, max_val: int = 100) -> int:
+    if not xml_text:
+        return 0
     try:
-        vresp = soap_call(
-            ip,
-            "/MediaRenderer/RenderingControl/Control",
-            "RenderingControl",
-            "GetVolume",
-            "<InstanceID>0</InstanceID><Channel>Master</Channel>",
-        )
-        raw = ET.fromstring(vresp).findtext(".//CurrentVolume")
+        raw = ET.fromstring(xml_text).findtext(f".//{tag}")
         if raw is not None:
-            vol = max(0, min(100, int(raw)))
+            return max(min_val, min(max_val, int(raw)))
     except Exception:
         pass
+    return 0
+
+
+def _parse_bool_tag(xml_text: str | None, tag: str) -> bool:
+    if not xml_text:
+        return False
     try:
-        mresp = soap_call(
-            ip,
-            "/MediaRenderer/RenderingControl/Control",
-            "RenderingControl",
-            "GetMute",
-            "<InstanceID>0</InstanceID><Channel>Master</Channel>",
-        )
-        raw = ET.fromstring(mresp).findtext(".//CurrentMute")
+        raw = ET.fromstring(xml_text).findtext(f".//{tag}")
         if raw is not None:
-            muted = raw.strip() in ("1", "true", "True")
+            return raw.strip() in ("1", "true", "True")
     except Exception:
         pass
-    return vol, muted
+    return False
 
 
-def fetch_group_state(
-    group: ZoneGroup,
-    include_audio: bool = True,
-    skip_stopped_details: bool = False,
-) -> TrackState | None:
-    ip = group.coord_ip
-    try:
-        tresp = soap_call(
-            ip,
-            "/MediaRenderer/AVTransport/Control",
-            "AVTransport",
-            "GetTransportInfo",
-            "<InstanceID>0</InstanceID>",
-        )
-        tstate = (ET.fromstring(tresp).findtext(".//CurrentTransportState") or "").strip()
-    except Exception:
-        return None
-
+def _parse_transport_status(xml_text: str) -> str:
+    tstate = (ET.fromstring(xml_text).findtext(".//CurrentTransportState") or "").strip()
     if tstate in ("PLAYING", "TRANSITIONING"):
-        status = "Playing"
-    elif tstate == "PAUSED_PLAYBACK":
-        status = "Paused"
-    else:
-        status = "Stopped"
+        return "Playing"
+    if tstate == "PAUSED_PLAYBACK":
+        return "Paused"
+    return "Stopped"
 
-    if skip_stopped_details and status == "Stopped":
-        return TrackState(
-            playback_status=status,
-            title="",
-            artist="",
-            album="",
-            art_url="",
-            source_name="",
-            source_icon="",
-            duration_sec=0,
-            position_sec=0,
-            track_num=0,
-            shuffle=False,
-            repeat="none",
-            group_volume=0,
-            group_muted=False,
-            can_next=False,
-            can_prev=False,
-        )
 
-    title = artist = album = art_url = ""
-    track_uri = current_uri = ""
+def _stopped_track_state() -> TrackState:
+    return TrackState(
+        playback_status="Stopped",
+        title="",
+        artist="",
+        album="",
+        art_url="",
+        source_name="",
+        source_icon="",
+        duration_sec=0,
+        position_sec=0,
+        track_num=0,
+        shuffle=False,
+        repeat="none",
+        group_volume=0,
+        group_muted=False,
+        can_next=False,
+        can_prev=False,
+    )
+
+
+def _parse_position_info(ip: str, xml_text: str | None) -> tuple[str, str, str, str, str, int, int, int]:
+    title = artist = album = art_url = track_uri = ""
     duration_sec = position_sec = track_num = 0
-    can_next = can_prev = True
-
+    if not xml_text:
+        return title, artist, album, art_url, track_uri, duration_sec, position_sec, track_num
     try:
-        presp = soap_call(
-            ip,
-            "/MediaRenderer/AVTransport/Control",
-            "AVTransport",
-            "GetPositionInfo",
-            "<InstanceID>0</InstanceID>",
-        )
-        proot = ET.fromstring(presp)
+        proot = ET.fromstring(xml_text)
         track_uri = (proot.findtext(".//TrackURI") or "").strip()
         meta_xml = proot.findtext(".//TrackMetaData") or ""
         duration_sec = parse_hms_to_sec(proot.findtext(".//TrackDuration") or "")
@@ -619,82 +703,67 @@ def fetch_group_state(
         except ValueError:
             track_num = 0
         title, artist, album, art_url = parse_didl_metadata(ip, meta_xml)
-
-        if not title or not track_uri:
-            mresp = soap_call(
-                ip,
-                "/MediaRenderer/AVTransport/Control",
-                "AVTransport",
-                "GetMediaInfo",
-                "<InstanceID>0</InstanceID>",
-            )
-            mroot = ET.fromstring(mresp)
-            current_uri = (mroot.findtext(".//CurrentURI") or "").strip()
-            uri_meta = mroot.findtext(".//CurrentURIMetaData") or ""
-            m_title, m_artist, m_album, m_art = parse_didl_metadata(ip, uri_meta)
-            title = title or m_title
-            artist = artist or m_artist
-            album = album or m_album
-            art_url = art_url or m_art
-
-        if track_uri.startswith(("x-sonos-htastream:", "x-rincon-stream:")):
-            can_next = False
-            can_prev = False
-            if not title:
-                title = "TV Audio" if "htastream" in track_uri else "Line-In"
     except Exception:
         pass
+    return title, artist, album, art_url, track_uri, duration_sec, position_sec, track_num
+
+
+def _parse_media_info(ip: str, xml_text: str | None) -> tuple[str, str, str, str, str]:
+    if not xml_text:
+        return "", "", "", "", ""
+    try:
+        mroot = ET.fromstring(xml_text)
+        current_uri = (mroot.findtext(".//CurrentURI") or "").strip()
+        uri_meta = mroot.findtext(".//CurrentURIMetaData") or ""
+        m_title, m_artist, m_album, m_art = parse_didl_metadata(ip, uri_meta)
+        return current_uri, m_title, m_artist, m_album, m_art
+    except Exception:
+        return "", "", "", "", ""
+
+
+def _parse_play_mode_xml(xml_text: str | None) -> tuple[bool, str]:
+    if not xml_text:
+        return False, "none"
+    try:
+        play_mode = ET.fromstring(xml_text).findtext(".//PlayMode") or "NORMAL"
+        return decode_play_mode(play_mode)
+    except Exception:
+        return False, "none"
+
+
+def _assemble_track_state(
+    group: ZoneGroup,
+    status: str,
+    pos_xml: str | None,
+    media_xml: str | None,
+    settings_xml: str | None,
+    vol_xml: str | None,
+    mute_xml: str | None,
+    include_audio: bool,
+) -> TrackState:
+    ip = group.coord_ip
+    title, artist, album, art_url, track_uri, duration_sec, position_sec, track_num = (
+        _parse_position_info(ip, pos_xml)
+    )
+    current_uri = ""
+    if media_xml:
+        current_uri, m_title, m_artist, m_album, m_art = _parse_media_info(ip, media_xml)
+        title = title or m_title
+        artist = artist or m_artist
+        album = album or m_album
+        art_url = art_url or m_art
+
+    can_next = can_prev = True
+    if track_uri.startswith(("x-sonos-htastream:", "x-rincon-stream:")):
+        can_next = False
+        can_prev = False
+        if not title:
+            title = "TV Audio" if "htastream" in track_uri else "Line-In"
 
     source_name, source_icon = detect_audio_source(ip, track_uri, current_uri)
-
-    shuffle = False
-    repeat = "none"
-    if include_audio or status == "Playing":
-        try:
-            sresp = soap_call(
-                ip,
-                "/MediaRenderer/AVTransport/Control",
-                "AVTransport",
-                "GetTransportSettings",
-                "<InstanceID>0</InstanceID>",
-            )
-            play_mode = ET.fromstring(sresp).findtext(".//PlayMode") or "NORMAL"
-            shuffle, repeat = decode_play_mode(play_mode)
-        except Exception:
-            pass
-
-    group_vol = 0
-    group_muted = False
-    if include_audio:
-        if len(group.member_uuids) > 1:
-            try:
-                gv = soap_call(
-                    ip,
-                    "/MediaRenderer/GroupRenderingControl/Control",
-                    "GroupRenderingControl",
-                    "GetGroupVolume",
-                    "<InstanceID>0</InstanceID>",
-                )
-                raw = ET.fromstring(gv).findtext(".//CurrentVolume")
-                if raw is not None:
-                    group_vol = max(0, min(100, int(raw)))
-            except Exception:
-                pass
-            try:
-                gm = soap_call(
-                    ip,
-                    "/MediaRenderer/GroupRenderingControl/Control",
-                    "GroupRenderingControl",
-                    "GetGroupMute",
-                    "<InstanceID>0</InstanceID>",
-                )
-                raw = ET.fromstring(gm).findtext(".//CurrentMute")
-                if raw is not None:
-                    group_muted = raw.strip() in ("1", "true", "True")
-            except Exception:
-                pass
-        else:
-            group_vol, group_muted = fetch_speaker_audio(ip)
+    shuffle, repeat = _parse_play_mode_xml(settings_xml)
+    group_vol = _parse_int_tag(vol_xml, "CurrentVolume") if include_audio else 0
+    group_muted = _parse_bool_tag(mute_xml, "CurrentMute") if include_audio else False
 
     return TrackState(
         playback_status=status,
@@ -716,7 +785,326 @@ def fetch_group_state(
     )
 
 
-def browse_content_directory(ip: str, object_id: str, limit: int = 100) -> list[dict]:
+def _soap_safe(ip: str, path: str, service: str, action: str, body: str = "") -> str | None:
+    try:
+        return soap_call(ip, path, service, action, body)
+    except Exception:
+        return None
+
+
+def _submit_group_detail_calls(
+    pool: concurrent.futures.ThreadPoolExecutor, group: ZoneGroup
+) -> dict[str, concurrent.futures.Future[str | None]]:
+    ip = group.coord_ip
+    futs: dict[str, concurrent.futures.Future[str | None]] = {
+        "pos": pool.submit(
+            _soap_safe,
+            ip,
+            "/MediaRenderer/AVTransport/Control",
+            "AVTransport",
+            "GetPositionInfo",
+            "<InstanceID>0</InstanceID>",
+        ),
+        "settings": pool.submit(
+            _soap_safe,
+            ip,
+            "/MediaRenderer/AVTransport/Control",
+            "AVTransport",
+            "GetTransportSettings",
+            "<InstanceID>0</InstanceID>",
+        ),
+    }
+    if len(group.member_uuids) > 1:
+        futs["vol"] = pool.submit(
+            _soap_safe,
+            ip,
+            "/MediaRenderer/GroupRenderingControl/Control",
+            "GroupRenderingControl",
+            "GetGroupVolume",
+            "<InstanceID>0</InstanceID>",
+        )
+        futs["mute"] = pool.submit(
+            _soap_safe,
+            ip,
+            "/MediaRenderer/GroupRenderingControl/Control",
+            "GroupRenderingControl",
+            "GetGroupMute",
+            "<InstanceID>0</InstanceID>",
+        )
+    else:
+        futs["vol"] = pool.submit(
+            _soap_safe,
+            ip,
+            "/MediaRenderer/RenderingControl/Control",
+            "RenderingControl",
+            "GetVolume",
+            "<InstanceID>0</InstanceID><Channel>Master</Channel>",
+        )
+        futs["mute"] = pool.submit(
+            _soap_safe,
+            ip,
+            "/MediaRenderer/RenderingControl/Control",
+            "RenderingControl",
+            "GetMute",
+            "<InstanceID>0</InstanceID><Channel>Master</Channel>",
+        )
+    return futs
+
+
+def fetch_groups_batch(
+    groups: list[ZoneGroup],
+    speakers: list[SpeakerInfo],
+    pool: concurrent.futures.ThreadPoolExecutor,
+    *,
+    include_speakers: bool = True,
+    known_active_uuids: set[str] | None = None,
+) -> tuple[dict[str, TrackState], dict[str, tuple[int, bool]], bool]:
+    """Fetch group states (and optionally per-speaker audio) using flat leaf SOAP calls.
+
+    When known_active_uuids is None, fetches full details and audio for every group
+    in a single parallel batch. When provided, only queries GetTransportInfo for
+    unknown/idle groups and fetches full details + audio only if they are active.
+    """
+    group_states: dict[str, TrackState] = {}
+    speaker_audio: dict[str, tuple[int, bool]] = {}
+    failed_any = False
+
+    if not groups:
+        return group_states, speaker_audio, False
+
+    full_all = known_active_uuids is None
+    transport_futs: dict[str, concurrent.futures.Future[str | None]] = {}
+    detail_futs: dict[str, dict[str, concurrent.futures.Future[str | None]]] = {}
+    for g in groups:
+        transport_futs[g.coord_uuid] = pool.submit(
+            _soap_safe,
+            g.coord_ip,
+            "/MediaRenderer/AVTransport/Control",
+            "AVTransport",
+            "GetTransportInfo",
+            "<InstanceID>0</InstanceID>",
+        )
+        if full_all or (known_active_uuids is not None and g.coord_uuid in known_active_uuids):
+            detail_futs[g.coord_uuid] = _submit_group_detail_calls(pool, g)
+
+    single_coords = {g.coord_uuid for g in groups if len(g.member_uuids) == 1}
+    speaker_futs: dict[
+        str, tuple[concurrent.futures.Future[str | None], concurrent.futures.Future[str | None]]
+    ] = {}
+    if include_speakers:
+        for s in speakers:
+            if s.is_coordinator and s.coord_uuid in single_coords:
+                continue
+            speaker_futs[s.uuid] = (
+                pool.submit(
+                    _soap_safe,
+                    s.ip,
+                    "/MediaRenderer/RenderingControl/Control",
+                    "RenderingControl",
+                    "GetVolume",
+                    "<InstanceID>0</InstanceID><Channel>Master</Channel>",
+                ),
+                pool.submit(
+                    _soap_safe,
+                    s.ip,
+                    "/MediaRenderer/RenderingControl/Control",
+                    "RenderingControl",
+                    "GetMute",
+                    "<InstanceID>0</InstanceID><Channel>Master</Channel>",
+                ),
+            )
+
+    statuses: dict[str, str] = {}
+    newly_active_details: dict[str, dict[str, concurrent.futures.Future[str | None]]] = {}
+    for g in groups:
+        tresp = transport_futs[g.coord_uuid].result()
+        if not tresp:
+            failed_any = True
+            continue
+        try:
+            status = _parse_transport_status(tresp)
+        except Exception:
+            failed_any = True
+            continue
+        statuses[g.coord_uuid] = status
+        if g.coord_uuid not in detail_futs:
+            if status == "Stopped":
+                group_states[g.coord_uuid] = _stopped_track_state()
+            else:
+                newly_active_details[g.coord_uuid] = _submit_group_detail_calls(pool, g)
+
+    detail_futs.update(newly_active_details)
+
+    # Collect detail responses and submit GetMediaInfo in parallel where needed.
+    collected: dict[str, tuple[str | None, str | None, str | None, str | None]] = {}
+    media_futs: dict[str, concurrent.futures.Future[str | None]] = {}
+    for g in groups:
+        if g.coord_uuid not in statuses or g.coord_uuid not in detail_futs:
+            continue
+        futs = detail_futs[g.coord_uuid]
+        pos_xml = futs["pos"].result()
+        settings_xml = futs["settings"].result()
+        vol_xml = futs["vol"].result()
+        mute_xml = futs["mute"].result()
+        collected[g.coord_uuid] = (pos_xml, settings_xml, vol_xml, mute_xml)
+        title, _, _, _, track_uri, _, _, _ = _parse_position_info(g.coord_ip, pos_xml)
+        if not title or not track_uri:
+            media_futs[g.coord_uuid] = pool.submit(
+                _soap_safe,
+                g.coord_ip,
+                "/MediaRenderer/AVTransport/Control",
+                "AVTransport",
+                "GetMediaInfo",
+                "<InstanceID>0</InstanceID>",
+            )
+
+    for g in groups:
+        if g.coord_uuid not in collected:
+            continue
+        pos_xml, settings_xml, vol_xml, mute_xml = collected[g.coord_uuid]
+        media_xml = media_futs[g.coord_uuid].result() if g.coord_uuid in media_futs else None
+        group_states[g.coord_uuid] = _assemble_track_state(
+            group=g,
+            status=statuses[g.coord_uuid],
+            pos_xml=pos_xml,
+            media_xml=media_xml,
+            settings_xml=settings_xml,
+            vol_xml=vol_xml,
+            mute_xml=mute_xml,
+            include_audio=True,
+        )
+
+    if include_speakers:
+        for s in speakers:
+            if s.is_coordinator and s.coord_uuid in single_coords and s.coord_uuid in group_states:
+                st = group_states[s.coord_uuid]
+                speaker_audio[s.uuid] = (st.group_volume, st.group_muted)
+            elif s.uuid in speaker_futs:
+                vfut, mfut = speaker_futs[s.uuid]
+                speaker_audio[s.uuid] = (
+                    _parse_int_tag(vfut.result(), "CurrentVolume"),
+                    _parse_bool_tag(mfut.result(), "CurrentMute"),
+                )
+
+    return group_states, speaker_audio, failed_any
+
+
+def fetch_speaker_audio(ip: str) -> tuple[int, bool]:
+    vresp = _soap_safe(
+        ip,
+        "/MediaRenderer/RenderingControl/Control",
+        "RenderingControl",
+        "GetVolume",
+        "<InstanceID>0</InstanceID><Channel>Master</Channel>",
+    )
+    mresp = _soap_safe(
+        ip,
+        "/MediaRenderer/RenderingControl/Control",
+        "RenderingControl",
+        "GetMute",
+        "<InstanceID>0</InstanceID><Channel>Master</Channel>",
+    )
+    return _parse_int_tag(vresp, "CurrentVolume"), _parse_bool_tag(mresp, "CurrentMute")
+
+
+def fetch_group_state(
+    group: ZoneGroup,
+    include_audio: bool = True,
+    skip_stopped_details: bool = False,
+) -> TrackState | None:
+    ip = group.coord_ip
+    try:
+        tresp = soap_call(
+            ip,
+            "/MediaRenderer/AVTransport/Control",
+            "AVTransport",
+            "GetTransportInfo",
+            "<InstanceID>0</InstanceID>",
+        )
+        status = _parse_transport_status(tresp)
+    except Exception:
+        return None
+
+    if skip_stopped_details and status == "Stopped":
+        return _stopped_track_state()
+
+    pos_xml = _soap_safe(
+        ip,
+        "/MediaRenderer/AVTransport/Control",
+        "AVTransport",
+        "GetPositionInfo",
+        "<InstanceID>0</InstanceID>",
+    )
+    media_xml: str | None = None
+    title, _, _, _, track_uri, _, _, _ = _parse_position_info(ip, pos_xml)
+    if not title or not track_uri:
+        media_xml = _soap_safe(
+            ip,
+            "/MediaRenderer/AVTransport/Control",
+            "AVTransport",
+            "GetMediaInfo",
+            "<InstanceID>0</InstanceID>",
+        )
+
+    settings_xml: str | None = None
+    if include_audio or status == "Playing":
+        settings_xml = _soap_safe(
+            ip,
+            "/MediaRenderer/AVTransport/Control",
+            "AVTransport",
+            "GetTransportSettings",
+            "<InstanceID>0</InstanceID>",
+        )
+
+    vol_xml: str | None = None
+    mute_xml: str | None = None
+    if include_audio:
+        if len(group.member_uuids) > 1:
+            vol_xml = _soap_safe(
+                ip,
+                "/MediaRenderer/GroupRenderingControl/Control",
+                "GroupRenderingControl",
+                "GetGroupVolume",
+                "<InstanceID>0</InstanceID>",
+            )
+            mute_xml = _soap_safe(
+                ip,
+                "/MediaRenderer/GroupRenderingControl/Control",
+                "GroupRenderingControl",
+                "GetGroupMute",
+                "<InstanceID>0</InstanceID>",
+            )
+        else:
+            vol_xml = _soap_safe(
+                ip,
+                "/MediaRenderer/RenderingControl/Control",
+                "RenderingControl",
+                "GetVolume",
+                "<InstanceID>0</InstanceID><Channel>Master</Channel>",
+            )
+            mute_xml = _soap_safe(
+                ip,
+                "/MediaRenderer/RenderingControl/Control",
+                "RenderingControl",
+                "GetMute",
+                "<InstanceID>0</InstanceID><Channel>Master</Channel>",
+            )
+
+    return _assemble_track_state(
+        group=group,
+        status=status,
+        pos_xml=pos_xml,
+        media_xml=media_xml,
+        settings_xml=settings_xml,
+        vol_xml=vol_xml,
+        mute_xml=mute_xml,
+        include_audio=include_audio,
+    )
+
+
+def browse_content_directory(
+    ip: str, object_id: str, limit: int = 100, *, minimal: bool = False
+) -> list[dict]:
     items: list[dict] = []
     start = 0
     batch = min(100, max(1, limit))
@@ -748,15 +1136,27 @@ def browse_content_directory(ip: str, object_id: str, limit: int = 100) -> list[
                 title = (el.findtext(f"{NS_DC}title") or "").strip()
                 artist = (el.findtext(f"{NS_DC}creator") or "").strip()
                 album = (el.findtext(f"{NS_UPNP}album") or "").strip()
+                res_el = el.find(f"{NS_DIDL}res")
+                dur_attr = res_el.attrib.get("duration", "") if res_el is not None else ""
+                if minimal:
+                    items.append(
+                        {
+                            "id": el.attrib.get("id", ""),
+                            "index": start + idx + 1,
+                            "title": title[:200],
+                            "artist": artist[:200],
+                            "album": album[:200],
+                            "duration_sec": parse_hms_to_sec(dur_attr),
+                        }
+                    )
+                    continue
                 art = resolve_art_url(ip, el.findtext(f"{NS_UPNP}albumArtURI") or "")
-                uri = (el.findtext(f"{NS_DIDL}res") or "").strip()
+                uri = ((res_el.text if res_el is not None else "") or "").strip()
                 res_md = (el.findtext(f"{NS_R}resMD") or "").strip()
+                # Avoid slicing DIDL XML mid-tag; drop oversized metadata instead of corrupting it.
+                safe_md = res_md if len(res_md) <= MAX_DIDL_METADATA_BYTES else ""
                 desc = (el.findtext(f"{NS_R}description") or "").strip()
                 upnp_class = (el.findtext(f"{NS_UPNP}class") or "").strip()
-                dur_attr = ""
-                res_el = el.find(f"{NS_DIDL}res")
-                if res_el is not None:
-                    dur_attr = res_el.attrib.get("duration", "")
                 items.append(
                     {
                         "id": el.attrib.get("id", ""),
@@ -767,7 +1167,7 @@ def browse_content_directory(ip: str, object_id: str, limit: int = 100) -> list[
                         "description": desc[:120],
                         "art_url": art[:1024],
                         "uri": uri[:1024],
-                        "metadata": res_md[:4096],
+                        "metadata": safe_md,
                         "kind": "favorite"
                         if object_id == "FV:2"
                         else ("playlist" if object_id == "SQ:" else "track"),
@@ -804,7 +1204,9 @@ def play_uri_on_coordinator(
         )
     )
 
-    if as_next and not is_stream:
+    if as_next:
+        if is_stream:
+            raise ValueError("cannot enqueue a live stream as next")
         body = (
             "<InstanceID>0</InstanceID>"
             f"<EnqueuedURI>{xml_escape(uri)}</EnqueuedURI>"
@@ -967,11 +1369,41 @@ def send_rpc_client(payload_str: str) -> int:
         sock.close()
 
 
+def find_group(groups: list[ZoneGroup], coord_uuid: str) -> ZoneGroup | None:
+    if not coord_uuid:
+        return groups[0] if groups else None
+    for g in groups:
+        if g.coord_uuid == coord_uuid:
+            return g
+    return None
+
+
+def acquire_instance_lock() -> int | None:
+    path = lock_file_path()
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    except OSError:
+        os.close(fd)
+        return None
+
+
 def run_daemon() -> int:
     import dbus
     import dbus.mainloop.glib
     import dbus.service
     from gi.repository import GLib
+
+    lock_fd = acquire_instance_lock()
+    if lock_fd is None:
+        return 0
 
     # Clean up any legacy state file from older versions; state is served on demand over RPC.
     try:
@@ -981,21 +1413,44 @@ def run_daemon() -> int:
     except OSError:
         pass
 
+    def loop_status_for(repeat: str) -> str:
+        if repeat == "one":
+            return "Track"
+        if repeat == "all":
+            return "Playlist"
+        return "None"
+
     class SonosMprisPlayer(dbus.service.Object):
-        def __init__(self, group: ZoneGroup, state: TrackState, on_action_cb) -> None:
+        def __init__(
+            self,
+            group: ZoneGroup,
+            state: TrackState,
+            on_action_cb,
+            action_pool: concurrent.futures.ThreadPoolExecutor,
+        ) -> None:
             self.group = group
             self.state = state
+            self._state_at = time.monotonic()
             self._on_action_cb = on_action_cb
+            self._action_pool = action_pool
+            self._vol_lock = threading.Lock()
+            self._pending_volume: int | None = None
+            self._vol_worker_running = False
+            self._closed = False
             self.bus_name_str = f"org.mpris.MediaPlayer2.sonos_{group.bus_suffix}"
             self._bus = dbus.SessionBus(private=True)
-            self._bus_name = dbus.service.BusName(self.bus_name_str, bus=self._bus)
+            self._bus_name: dbus.service.BusName | None = dbus.service.BusName(
+                self.bus_name_str, bus=self._bus
+            )
             super().__init__(self._bus, MPRIS_PATH)
 
         def close(self) -> None:
+            self._closed = True
             try:
                 self.remove_from_connection()
             except Exception:
                 pass
+            self._bus_name = None
             try:
                 self._bus.close()
             except Exception:
@@ -1003,6 +1458,13 @@ def run_daemon() -> int:
 
         def _identity(self) -> str:
             return f"Sonos · {self.group.room_label}"
+
+        def _current_position_us(self) -> int:
+            st = self.state
+            if st.playback_status == "Playing" and st.duration_sec > 0:
+                elapsed_us = max(0, int((time.monotonic() - self._state_at) * 1_000_000))
+                return min(st.duration_us, st.position_us + elapsed_us)
+            return st.position_us
 
         def _metadata_dict(self) -> dbus.Dictionary:
             st = self.state
@@ -1044,16 +1506,12 @@ def run_daemon() -> int:
             st = self.state
             return {
                 "PlaybackStatus": dbus.String(st.playback_status),
-                "LoopStatus": dbus.String(
-                    "Track"
-                    if st.repeat == "one"
-                    else ("Playlist" if st.repeat == "all" else "None")
-                ),
+                "LoopStatus": dbus.String(loop_status_for(st.repeat)),
                 "Rate": dbus.Double(1.0),
                 "Shuffle": dbus.Boolean(st.shuffle),
                 "Metadata": self._metadata_dict(),
                 "Volume": dbus.Double(st.group_volume / 100.0),
-                "Position": dbus.Int64(st.position_us),
+                "Position": dbus.Int64(self._current_position_us()),
                 "MinimumRate": dbus.Double(1.0),
                 "MaximumRate": dbus.Double(1.0),
                 "CanGoNext": dbus.Boolean(st.can_next),
@@ -1069,6 +1527,7 @@ def run_daemon() -> int:
             old_state = self.state
             self.group = group
             self.state = state
+            self._state_at = time.monotonic()
 
             if old_group.room_label != group.room_label:
                 self.PropertiesChanged(
@@ -1082,6 +1541,8 @@ def run_daemon() -> int:
             changed: dict[str, object] = {}
             if old_state.playback_status != state.playback_status:
                 changed["PlaybackStatus"] = dbus.String(state.playback_status)
+            if old_state.repeat != state.repeat:
+                changed["LoopStatus"] = dbus.String(loop_status_for(state.repeat))
             if (
                 old_state.title != state.title
                 or old_state.artist != state.artist
@@ -1119,7 +1580,41 @@ def run_daemon() -> int:
                     pass
                 self._on_action_cb()
 
-            threading.Thread(target=worker, daemon=True).start()
+            try:
+                self._action_pool.submit(worker)
+            except RuntimeError:
+                pass
+
+        def _drain_volume_writes(self) -> None:
+            while True:
+                with self._vol_lock:
+                    vol = self._pending_volume
+                    self._pending_volume = None
+                    if vol is None or self._closed:
+                        self._vol_worker_running = False
+                        break
+                group = self.group
+                try:
+                    if len(group.member_uuids) > 1:
+                        soap_call(
+                            group.coord_ip,
+                            "/MediaRenderer/GroupRenderingControl/Control",
+                            "GroupRenderingControl",
+                            "SetGroupVolume",
+                            f"<InstanceID>0</InstanceID><DesiredVolume>{vol}</DesiredVolume>",
+                        )
+                    else:
+                        soap_call(
+                            group.coord_ip,
+                            "/MediaRenderer/RenderingControl/Control",
+                            "RenderingControl",
+                            "SetVolume",
+                            f"<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>{vol}</DesiredVolume>",
+                        )
+                except Exception:
+                    pass
+            if not self._closed:
+                self._on_action_cb()
 
         @dbus.service.method(MPRIS_IFACE)
         def Raise(self) -> None:
@@ -1131,6 +1626,8 @@ def run_daemon() -> int:
 
         @dbus.service.method(PLAYER_IFACE)
         def Play(self) -> None:
+            self.state = replace(self.state, playback_status="Playing")
+            self._state_at = time.monotonic()
             self._run_soap_async(
                 "/MediaRenderer/AVTransport/Control",
                 "AVTransport",
@@ -1140,6 +1637,8 @@ def run_daemon() -> int:
 
         @dbus.service.method(PLAYER_IFACE)
         def Pause(self) -> None:
+            self.state = replace(self.state, playback_status="Paused")
+            self._state_at = time.monotonic()
             self._run_soap_async(
                 "/MediaRenderer/AVTransport/Control",
                 "AVTransport",
@@ -1156,6 +1655,8 @@ def run_daemon() -> int:
 
         @dbus.service.method(PLAYER_IFACE)
         def Stop(self) -> None:
+            self.state = replace(self.state, playback_status="Stopped")
+            self._state_at = time.monotonic()
             self._run_soap_async(
                 "/MediaRenderer/AVTransport/Control",
                 "AVTransport",
@@ -1184,6 +1685,8 @@ def run_daemon() -> int:
         @dbus.service.method(PLAYER_IFACE, in_signature="ox")
         def SetPosition(self, _track_id, position_us) -> None:
             sec = max(0, int(int(position_us) // 1_000_000))
+            self.state = replace(self.state, position_sec=sec)
+            self._state_at = time.monotonic()
             self._run_soap_async(
                 "/MediaRenderer/AVTransport/Control",
                 "AVTransport",
@@ -1213,20 +1716,27 @@ def run_daemon() -> int:
         def Set(self, interface_name: str, property_name: str, value) -> None:
             if interface_name == PLAYER_IFACE and property_name == "Volume":
                 vol = max(0, min(100, int(round(float(value) * 100))))
-                if len(self.group.member_uuids) > 1:
-                    self._run_soap_async(
-                        "/MediaRenderer/GroupRenderingControl/Control",
-                        "GroupRenderingControl",
-                        "SetGroupVolume",
-                        f"<InstanceID>0</InstanceID><DesiredVolume>{vol}</DesiredVolume>",
+                if vol != self.state.group_volume:
+                    self.state = replace(self.state, group_volume=vol)
+                    self.PropertiesChanged(
+                        PLAYER_IFACE,
+                        dbus.Dictionary(
+                            {"Volume": dbus.Double(vol / 100.0)}, signature="sv"
+                        ),
+                        dbus.Array([], signature="s"),
                     )
-                else:
-                    self._run_soap_async(
-                        "/MediaRenderer/RenderingControl/Control",
-                        "RenderingControl",
-                        "SetVolume",
-                        f"<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>{vol}</DesiredVolume>",
-                    )
+                should_start = False
+                with self._vol_lock:
+                    self._pending_volume = vol
+                    if not self._vol_worker_running:
+                        self._vol_worker_running = True
+                        should_start = True
+                if should_start:
+                    try:
+                        self._action_pool.submit(self._drain_volume_writes)
+                    except RuntimeError:
+                        with self._vol_lock:
+                            self._vol_worker_running = False
 
         @dbus.service.signal(PROPS_IFACE, signature="sa{sv}as")
         def PropertiesChanged(
@@ -1240,6 +1750,7 @@ def run_daemon() -> int:
             self.stop_event = threading.Event()
             self.wake_event = threading.Event()
             self.lock = threading.Lock()
+            self._topo_lock = threading.Lock()
             self.players: dict[str, SonosMprisPlayer] = {}
             self._seed_ips: list[str] = []
             self._groups: list[ZoneGroup] = []
@@ -1250,101 +1761,142 @@ def run_daemon() -> int:
             self._last_discovery = 0.0
             self._last_topology = 0.0
             self._last_full_sweep = 0.0
+            self._last_snapshot_at = 0.0
+            self._snapshot_seq = 0
+            self._explicit_wake = False
             self._library_cache: list[dict] = []
             self._library_cache_at = 0.0
+            self._pending_mpris_snapshot: dict[str, tuple[ZoneGroup, TrackState]] | None = None
+            self._mpris_flush_scheduled = False
             self._rpc_sock: socket.socket | None = None
+            # _soap_pool only executes leaf SOAP/HTTP calls so tasks never nest or deadlock.
+            self._soap_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=16, thread_name_prefix="sonos-soap"
+            )
+            self._rpc_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=8, thread_name_prefix="sonos-rpc"
+            )
+            self._action_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="sonos-act"
+            )
 
-        def trigger_poll(self, force_topology: bool = False) -> None:
-            if force_topology:
-                self._last_topology = 0.0
-            self._last_full_sweep = 0.0
+        def trigger_poll(
+            self, force_topology: bool = False, full_sweep: bool = False
+        ) -> None:
+            with self.lock:
+                if force_topology:
+                    self._last_topology = 0.0
+                if full_sweep or force_topology:
+                    self._last_full_sweep = 0.0
+                self._explicit_wake = True
             self.wake_event.set()
 
-        def _ensure_topology(self, force: bool = False, interval: float = TOPOLOGY_ACTIVE_INTERVAL) -> tuple[list[ZoneGroup], list[SpeakerInfo]]:
-            now = time.monotonic()
-            if not self._seed_ips or (force and not self._groups) or (now - self._last_discovery) >= DISCOVERY_INTERVAL:
-                if force or not self._seed_ips or (now - self._last_discovery) >= DISCOVERY_INTERVAL:
+        def _schedule_mpris_update(
+            self, snapshot: dict[str, tuple[ZoneGroup, TrackState]]
+        ) -> None:
+            schedule = False
+            with self.lock:
+                self._pending_mpris_snapshot = snapshot
+                if not self._mpris_flush_scheduled:
+                    self._mpris_flush_scheduled = True
+                    schedule = True
+            if schedule:
+                GLib.idle_add(self._flush_mpris_on_main)
+
+        def _flush_mpris_on_main(self) -> bool:
+            with self.lock:
+                snapshot = self._pending_mpris_snapshot
+                self._pending_mpris_snapshot = None
+                self._mpris_flush_scheduled = False
+            if snapshot is not None:
+                self._apply_mpris_on_main(snapshot)
+            return False
+
+        def _ensure_topology(
+            self, force: bool = False, interval: float = TOPOLOGY_ACTIVE_INTERVAL
+        ) -> tuple[list[ZoneGroup], list[SpeakerInfo]]:
+            with self._topo_lock:
+                now = time.monotonic()
+                with self.lock:
+                    seed_ips = list(self._seed_ips)
+                    has_groups = bool(self._groups)
+                    last_discovery = self._last_discovery
+                    last_topology = self._last_topology
+
+                need_discovery = (
+                    not seed_ips
+                    or (now - last_discovery) >= DISCOVERY_INTERVAL
+                    or (force and (now - last_discovery) >= FORCE_DISCOVERY_MIN_INTERVAL)
+                )
+                if need_discovery:
                     found = discover_sonos_ips()
                     if found:
-                        self._seed_ips = found
-                    self._last_discovery = now
-
-            if self._seed_ips and (force or not self._groups or (now - self._last_topology) >= interval):
-                groups, speakers = fetch_topology(self._seed_ips)
-                if groups:
+                        seed_ips = found
+                    last_discovery = time.monotonic()
                     with self.lock:
-                        self._groups = groups
-                        self._speakers = speakers
-                    self._seed_ips = [g.coord_ip for g in groups] + [
-                        ip
-                        for ip in self._seed_ips
-                        if ip not in {g.coord_ip for g in groups}
-                    ]
-                    self._last_topology = now
-                else:
-                    with self.lock:
-                        self._groups = []
-                        self._speakers = []
-                    self._seed_ips = []
+                        self._seed_ips = list(seed_ips)
+                        self._last_discovery = last_discovery
 
-            with self.lock:
-                return list(self._groups), list(self._speakers)
+                if seed_ips and (
+                    force or not has_groups or (now - last_topology) >= interval
+                ):
+                    groups, speakers = fetch_topology(seed_ips)
+                    if not groups and force and not need_discovery:
+                        found = discover_sonos_ips()
+                        last_discovery = time.monotonic()
+                        with self.lock:
+                            self._last_discovery = last_discovery
+                        if found:
+                            seed_ips = found
+                            groups, speakers = fetch_topology(seed_ips)
+
+                    if groups:
+                        coord_ips = {g.coord_ip for g in groups}
+                        new_seeds = [g.coord_ip for g in groups] + [
+                            ip for ip in seed_ips if ip not in coord_ips
+                        ]
+                        with self.lock:
+                            self._groups = groups
+                            self._speakers = speakers
+                            self._seed_ips = new_seeds
+                            self._last_topology = time.monotonic()
+                    else:
+                        with self.lock:
+                            self._groups = []
+                            self._speakers = []
+                            self._seed_ips = []
+
+                with self.lock:
+                    return list(self._groups), list(self._speakers)
 
         def _fetch_full_snapshot(self, force_topology: bool = False) -> dict:
             groups, speakers = self._ensure_topology(
                 force=force_topology, interval=10.0
             )
-            group_states: dict[str, TrackState] = {}
-            speaker_audio: dict[str, tuple[int, bool]] = {}
+            group_states, speaker_audio, failed_any = fetch_groups_batch(
+                groups,
+                speakers,
+                self._soap_pool,
+                include_speakers=True,
+                known_active_uuids=None,
+            )
+
             mpris_snapshot: dict[str, tuple[ZoneGroup, TrackState]] = {}
-
-            if groups:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, max(1, len(groups) + len(speakers)))) as ex:
-                    g_futures = {
-                        ex.submit(fetch_group_state, g, True, False): g for g in groups
-                    }
-                    single_coords = {
-                        g.coord_uuid for g in groups if len(g.member_uuids) == 1
-                    }
-                    s_futures = {
-                        ex.submit(fetch_speaker_audio, s.ip): s
-                        for s in speakers
-                        if not (s.is_coordinator and s.coord_uuid in single_coords)
-                    }
-
-                    for fut, g in g_futures.items():
-                        try:
-                            st = fut.result()
-                        except Exception:
-                            st = None
-                        if st is None:
-                            self._last_topology = 0.0
-                            continue
-                        group_states[g.coord_uuid] = st
-                        if st.playback_status == "Playing" or st.has_track:
-                            mpris_snapshot[g.coord_uuid] = (g, st)
-
-                    for s in speakers:
-                        if s.is_coordinator and s.coord_uuid in single_coords and s.coord_uuid in group_states:
-                            st = group_states[s.coord_uuid]
-                            speaker_audio[s.uuid] = (st.group_volume, st.group_muted)
-
-                    for fut, s in s_futures.items():
-                        try:
-                            speaker_audio[s.uuid] = fut.result()
-                        except Exception:
-                            speaker_audio[s.uuid] = (0, False)
+            for g in groups:
+                st = group_states.get(g.coord_uuid)
+                if st and (st.playback_status == "Playing" or st.has_track):
+                    mpris_snapshot[g.coord_uuid] = (g, st)
 
             with self.lock:
+                if failed_any:
+                    self._last_topology = 0.0
                 self._group_states = group_states
                 self._speaker_audio = speaker_audio
-                self._active_uuids = {
-                    uuid
-                    for uuid, st in group_states.items()
-                    if st.playback_status == "Playing" or st.has_track
-                }
+                self._active_uuids = set(mpris_snapshot.keys())
+                self._last_snapshot_at = time.monotonic()
+                self._snapshot_seq += 1
 
-            GLib.idle_add(self._apply_mpris_on_main, mpris_snapshot)
+            self._schedule_mpris_update(mpris_snapshot)
             return build_state_payload(groups, speakers, group_states, speaker_audio)
 
         def _apply_mpris_on_main(
@@ -1361,7 +1913,10 @@ def run_daemon() -> int:
                 else:
                     try:
                         self.players[uuid] = SonosMprisPlayer(
-                            group, state, on_action_cb=self.trigger_poll
+                            group,
+                            state,
+                            on_action_cb=self.trigger_poll,
+                            action_pool=self._action_pool,
                         )
                     except Exception:
                         pass
@@ -1369,10 +1924,7 @@ def run_daemon() -> int:
 
         def _find_group(self, coord_uuid: str) -> ZoneGroup | None:
             with self.lock:
-                for g in self._groups:
-                    if g.coord_uuid == coord_uuid:
-                        return g
-                return self._groups[0] if self._groups else None
+                return find_group(self._groups, coord_uuid)
 
         def _find_speaker(self, speaker_uuid: str) -> SpeakerInfo | None:
             with self.lock:
@@ -1393,33 +1945,45 @@ def run_daemon() -> int:
             group = self._find_group(coord_uuid)
 
             if cmd == "refresh":
-                self.trigger_poll(force_topology=True)
+                self.trigger_poll(force_topology=True, full_sweep=True)
                 return self._fetch_full_snapshot(force_topology=True)
 
             if cmd == "browse_library":
                 force = bool(req.get("force", False))
                 now = time.monotonic()
-                if (
-                    not force
-                    and self._library_cache
-                    and (now - self._library_cache_at) < LIBRARY_CACHE_TTL
-                ):
-                    return {"ok": True, "items": self._library_cache}
-                ip = group.coord_ip if group else (self._seed_ips[0] if self._seed_ips else "")
+                with self.lock:
+                    if (
+                        not force
+                        and self._library_cache
+                        and (now - self._library_cache_at) < LIBRARY_CACHE_TTL
+                    ):
+                        return {"ok": True, "items": list(self._library_cache)}
+                    seed_ip = self._seed_ips[0] if self._seed_ips else ""
+                ip = group.coord_ip if group else seed_ip
+                if not ip:
+                    groups, _ = self._ensure_topology(force=False)
+                    ip = groups[0].coord_ip if groups else ""
                 if not ip:
                     return {"ok": False, "error": "no Sonos speakers discovered"}
-                favs = browse_content_directory(ip, "FV:2", limit=100)
-                playlists = browse_content_directory(ip, "SQ:", limit=100)
-                items = favs + playlists
-                self._library_cache = items
-                self._library_cache_at = now
+                fav_fut = self._soap_pool.submit(
+                    browse_content_directory, ip, "FV:2", 100
+                )
+                pl_fut = self._soap_pool.submit(
+                    browse_content_directory, ip, "SQ:", 100
+                )
+                items = fav_fut.result() + pl_fut.result()
+                with self.lock:
+                    self._library_cache = items
+                    self._library_cache_at = time.monotonic()
                 return {"ok": True, "items": items}
 
             if cmd == "browse_queue":
                 if not group:
                     return {"ok": False, "error": "no Sonos group"}
                 limit = max(1, min(300, int(req.get("limit", 150))))
-                items = browse_content_directory(group.coord_ip, "Q:0", limit=limit)
+                items = browse_content_directory(
+                    group.coord_ip, "Q:0", limit=limit, minimal=True
+                )
                 return {"ok": True, "items": items, "coord_uuid": group.coord_uuid}
 
             if cmd in ("play", "pause", "play_pause", "next", "previous", "stop"):
@@ -1469,6 +2033,18 @@ def run_daemon() -> int:
                         "Stop",
                         "<InstanceID>0</InstanceID>",
                     )
+                if cmd in ("play", "pause", "stop"):
+                    new_status = (
+                        "Playing"
+                        if cmd == "play"
+                        else ("Paused" if cmd == "pause" else "Stopped")
+                    )
+                    with self.lock:
+                        st = self._group_states.get(group.coord_uuid)
+                        if st is not None:
+                            self._group_states[group.coord_uuid] = replace(
+                                st, playback_status=new_status
+                            )
                 self.trigger_poll()
                 return {"ok": True}
 
@@ -1560,6 +2136,7 @@ def run_daemon() -> int:
                     "SetVolume",
                     f"<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>{vol}</DesiredVolume>",
                 )
+                self.trigger_poll()
                 return {"ok": True}
 
             if cmd == "set_speaker_mute":
@@ -1574,6 +2151,7 @@ def run_daemon() -> int:
                     "SetMute",
                     f"<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredMute>{muted}</DesiredMute>",
                 )
+                self.trigger_poll()
                 return {"ok": True}
 
             if cmd == "join_group":
@@ -1591,7 +2169,7 @@ def run_daemon() -> int:
                         f"<CurrentURI>{xml_escape(f'x-rincon:{target.coord_uuid}')}</CurrentURI>"
                         "<CurrentURIMetaData></CurrentURIMetaData>",
                     )
-                self.trigger_poll(force_topology=True)
+                self.trigger_poll(force_topology=True, full_sweep=True)
                 return {"ok": True}
 
             if cmd == "leave_group":
@@ -1605,7 +2183,7 @@ def run_daemon() -> int:
                     "BecomeCoordinatorOfStandaloneGroup",
                     "<InstanceID>0</InstanceID>",
                 )
-                self.trigger_poll(force_topology=True)
+                self.trigger_poll(force_topology=True, full_sweep=True)
                 return {"ok": True}
 
             if cmd == "play_item":
@@ -1673,9 +2251,13 @@ def run_daemon() -> int:
                         continue
                     except OSError:
                         break
-                    threading.Thread(
-                        target=self._serve_client, args=(conn,), daemon=True
-                    ).start()
+                    try:
+                        self._rpc_pool.submit(self._serve_client, conn)
+                    except RuntimeError:
+                        try:
+                            conn.close()
+                        except OSError:
+                            pass
             finally:
                 try:
                     srv.close()
@@ -1715,26 +2297,42 @@ def run_daemon() -> int:
                 now = time.monotonic()
                 with self.lock:
                     had_active = bool(self._active_uuids)
+                    last_snapshot_at = self._last_snapshot_at
+                    explicit_wake = self._explicit_wake
+                    self._explicit_wake = False
+
+                # If the open panel just fetched a full snapshot, avoid duplicating LAN polls.
+                recent_interval = compute_poll_interval(had_active, True)
+                grace = 0.2 if had_active else 0.0
+                if (
+                    not explicit_wake
+                    and last_snapshot_at > 0.0
+                    and (now - last_snapshot_at) < (recent_interval + grace)
+                ):
+                    wait_s = max(0.2, (recent_interval + grace) - (now - last_snapshot_at))
+                    self.wake_event.wait(timeout=wait_s)
+                    self.wake_event.clear()
+                    continue
+
                 topo_interval = (
                     TOPOLOGY_ACTIVE_INTERVAL if had_active else TOPOLOGY_IDLE_INTERVAL
                 )
                 groups, _ = self._ensure_topology(force=False, interval=topo_interval)
 
                 if not groups:
-                    GLib.idle_add(self._apply_mpris_on_main, {})
+                    self._schedule_mpris_update({})
                     self.wake_event.wait(
                         timeout=compute_poll_interval(False, False)
                     )
                     self.wake_event.clear()
                     continue
 
-                full_sweep = (now - self._last_full_sweep) >= IDLE_SWEEP_INTERVAL
-                if full_sweep:
-                    self._last_full_sweep = now
-
                 with self.lock:
+                    full_sweep = (now - self._last_full_sweep) >= IDLE_SWEEP_INTERVAL
+                    if full_sweep:
+                        self._last_full_sweep = now
                     active_uuids = set(self._active_uuids)
-                    group_states = dict(self._group_states)
+                    seq_before = self._snapshot_seq
 
                 targets = (
                     groups
@@ -1742,46 +2340,53 @@ def run_daemon() -> int:
                     else [g for g in groups if g.coord_uuid in active_uuids]
                 )
 
-                # Closed-panel loop: poll only target coordinators (skipping per-speaker
-                # volumes and skipping stopped-speaker metadata) and write zero state files.
-                for group in targets:
-                    if self.stop_event.is_set():
-                        break
-                    is_known_active = group.coord_uuid in active_uuids
-                    st = fetch_group_state(
-                        group,
-                        include_audio=is_known_active,
-                        skip_stopped_details=not is_known_active,
-                    )
-                    if st is None:
-                        self._last_topology = 0.0
-                        continue
-                    group_states[group.coord_uuid] = st
+                # Closed-panel loop: poll target coordinators in parallel (skipping
+                # per-speaker volumes and stopped-speaker metadata) with zero state files.
+                polled_states, _, failed_any = fetch_groups_batch(
+                    targets,
+                    [],
+                    self._soap_pool,
+                    include_speakers=False,
+                    known_active_uuids=active_uuids,
+                )
 
                 mpris_snapshot: dict[str, tuple[ZoneGroup, TrackState]] = {}
                 next_active: set[str] = set()
                 any_playing = False
                 valid_uuids = {g.coord_uuid for g in groups}
 
-                for g in groups:
-                    st = group_states.get(g.coord_uuid)
-                    if not st:
-                        continue
-                    if st.playback_status == "Playing":
-                        any_playing = True
-                    if st.playback_status == "Playing" or st.has_track:
-                        next_active.add(g.coord_uuid)
-                        mpris_snapshot[g.coord_uuid] = (g, st)
-
-                group_states = {
-                    k: v for k, v in group_states.items() if k in valid_uuids
-                }
-
                 with self.lock:
-                    self._group_states = group_states
-                    self._active_uuids = next_active
+                    if failed_any:
+                        self._last_topology = 0.0
+                    # If _fetch_full_snapshot ran while we were polling, keep its fresher data.
+                    if self._snapshot_seq == seq_before:
+                        merged = {
+                            k: v
+                            for k, v in self._group_states.items()
+                            if k in valid_uuids
+                        }
+                        merged.update(polled_states)
+                        for g in groups:
+                            st = merged.get(g.coord_uuid)
+                            if not st:
+                                continue
+                            if st.playback_status == "Playing":
+                                any_playing = True
+                            if st.playback_status == "Playing" or st.has_track:
+                                next_active.add(g.coord_uuid)
+                                mpris_snapshot[g.coord_uuid] = (g, st)
+                        self._group_states = merged
+                        self._active_uuids = next_active
+                        should_publish = True
+                    else:
+                        any_playing = any(
+                            st.playback_status == "Playing"
+                            for st in self._group_states.values()
+                        )
+                        should_publish = False
 
-                GLib.idle_add(self._apply_mpris_on_main, mpris_snapshot)
+                if should_publish:
+                    self._schedule_mpris_update(mpris_snapshot)
 
                 interval = compute_poll_interval(any_playing, bool(groups))
                 self.wake_event.wait(timeout=interval)
@@ -1799,6 +2404,12 @@ def run_daemon() -> int:
                     self._rpc_sock.close()
                 except OSError:
                     pass
+            for pool in (self._soap_pool, self._rpc_pool, self._action_pool):
+                try:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+            _HTTP_POOL.close_all()
             for player in list(self.players.values()):
                 player.close()
             self.players.clear()
@@ -1821,6 +2432,10 @@ def run_daemon() -> int:
         loop.run()
     finally:
         controller.shutdown()
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
     return 0
 
 

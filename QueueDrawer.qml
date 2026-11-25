@@ -18,7 +18,7 @@ Item {
 
   readonly property int itemCount: controller.filteredQueue.length
   readonly property real listDesiredHeight: itemCount > 0
-    ? (qList.contentHeight > 0 ? qList.contentHeight : itemCount * Style.space(41))
+    ? (itemCount * Style.space(38) + Math.max(0, itemCount - 1) * Style.space(3))
     : statusText.implicitHeight
   readonly property real desiredHeight: searchRow.implicitHeight + Style.space(8) + listDesiredHeight
 

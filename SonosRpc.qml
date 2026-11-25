@@ -17,25 +17,51 @@ Item {
   property bool libraryLoading: false
   property bool queueLoading: false
 
-  signal stateReceived(var data)
-  signal libraryReceived(var items)
-  signal queueReceived(var items)
+  // Emit raw JSON strings so listeners parse once into native JS objects/arrays
+  // without crossing a `var` signal boundary into Qt sequences.
+  signal stateReceived(string rawJson)
+  signal libraryReceived(string rawJson)
+  signal queueReceived(string rawJson)
   signal commandCompleted()
 
-  // Lists that cross a `var` signal arrive as Qt sequences, which fail Array.isArray().
-  function isList(value) {
-    return value !== null && value !== undefined && typeof value === "object" && typeof value.length === "number"
+  property var _cmdQueue: []
+  property var _pendingVolumes: ({})
+  property var _pendingStateFetch: null
+  property var _pendingQueueFetch: null
+
+  function _volumeKey(payload) {
+    if (!payload) return ""
+    if (payload.cmd === "set_group_volume") return "g:" + (payload.coord_uuid || "")
+    if (payload.cmd === "set_speaker_volume") return "s:" + (payload.speaker_uuid || "")
+    return ""
   }
 
-  property var _cmdQueue: []
-  property var _pendingVolumePayload: null
+  function _hasPendingVolumes() {
+    for (var k in _pendingVolumes) return true
+    return false
+  }
 
   function fetchState(forceTopology, showSpinner) {
-    if (!socketPath || stateChan.busy) return
+    if (!socketPath) return
+    if (stateChan.busy) {
+      var prev = _pendingStateFetch
+      _pendingStateFetch = {
+        forceTopology: (prev ? prev.forceTopology : false) || !!forceTopology,
+        showSpinner: (prev ? prev.showSpinner : false) || !!showSpinner
+      }
+      return
+    }
     if (showSpinner) stateLoading = true
     if (!stateChan.send({ cmd: "get_state", force_topology: !!forceTopology })) {
       stateLoading = false
     }
+  }
+
+  function _drainPendingStateFetch() {
+    if (!_pendingStateFetch || stateChan.busy) return
+    var next = _pendingStateFetch
+    _pendingStateFetch = null
+    fetchState(next.forceTopology, next.showSpinner)
   }
 
   function fetchLibrary(force) {
@@ -47,17 +73,34 @@ Item {
   }
 
   function fetchQueue(coordUuid, limit) {
-    if (!socketPath || !coordUuid || queueChan.busy) return
+    if (!socketPath || !coordUuid) return
+    if (queueChan.busy) {
+      _pendingQueueFetch = { coordUuid: coordUuid, limit: limit }
+      return
+    }
     queueLoading = true
     if (!queueChan.send({ cmd: "browse_queue", coord_uuid: coordUuid, limit: limit })) {
       queueLoading = false
     }
   }
 
+  function _drainPendingQueueFetch() {
+    if (!_pendingQueueFetch || queueChan.busy) return
+    var next = _pendingQueueFetch
+    _pendingQueueFetch = null
+    fetchQueue(next.coordUuid, next.limit)
+  }
+
   function sendCommand(payload) {
     if (!socketPath || !payload) return
-    // Coalesce queued volume updates for the same target so rapid steps stay snappy.
-    if (payload.cmd === "set_group_volume" || payload.cmd === "set_speaker_volume") {
+    // Clear any stale debounced drag update for the same target so it cannot
+    // overwrite a final release or direct volume step.
+    var volKey = _volumeKey(payload)
+    if (volKey !== "") {
+      if (_pendingVolumes[volKey]) {
+        delete _pendingVolumes[volKey]
+        if (!_hasPendingVolumes() && volumeDebounce.running) volumeDebounce.stop()
+      }
       var targetKey = payload.cmd === "set_group_volume" ? "coord_uuid" : "speaker_uuid"
       for (var i = _cmdQueue.length - 1; i >= 0; i--) {
         if (_cmdQueue[i].cmd === payload.cmd && _cmdQueue[i][targetKey] === payload[targetKey]) {
@@ -72,16 +115,21 @@ Item {
   }
 
   function queueVolumeChange(payload) {
-    _pendingVolumePayload = payload
+    var volKey = _volumeKey(payload)
+    if (volKey === "") {
+      sendCommand(payload)
+      return
+    }
+    _pendingVolumes[volKey] = payload
     if (!volumeDebounce.running) volumeDebounce.start()
   }
 
   function flushPendingVolume() {
     if (volumeDebounce.running) volumeDebounce.stop()
-    if (_pendingVolumePayload) {
-      var p = _pendingVolumePayload
-      _pendingVolumePayload = null
-      sendCommand(p)
+    var pending = _pendingVolumes
+    _pendingVolumes = ({})
+    for (var k in pending) {
+      sendCommand(pending[k])
     }
   }
 
@@ -95,47 +143,51 @@ Item {
     id: volumeDebounce
     interval: 75
     repeat: false
-    onTriggered: {
-      if (root._pendingVolumePayload) {
-        var p = root._pendingVolumePayload
-        root._pendingVolumePayload = null
-        root.sendCommand(p)
-      }
-    }
+    onTriggered: root.flushPendingVolume()
   }
 
   component RpcChannel: Item {
     id: ch
     property string socketPath: ""
+    property int timeoutMs: 8000
     property bool busy: false
     property string pendingLine: ""
+    property int requestSeq: 0
 
-    signal response(var data)
+    signal rawResponse(string line)
     signal failed()
 
     function send(payloadObj) {
       if (busy || !socketPath) return false
+      requestSeq += 1
       pendingLine = JSON.stringify(payloadObj)
       busy = true
       timeoutTimer.restart()
-      sock.connected = true
+      if (sock.connected) {
+        var line = pendingLine
+        pendingLine = ""
+        sock.write(line + "\n")
+        sock.flush()
+      } else {
+        sock.connected = true
+      }
       return true
     }
 
-    function finish(ok, parsed) {
+    function finish(ok, line) {
       timeoutTimer.stop()
       pendingLine = ""
       busy = false
       if (sock.connected) sock.connected = false
-      if (ok) response(parsed)
+      if (ok) rawResponse(line)
       else failed()
     }
 
     Timer {
       id: timeoutTimer
-      interval: 5000
+      interval: ch.timeoutMs
       repeat: false
-      onTriggered: if (ch.busy) ch.finish(false, null)
+      onTriggered: if (ch.busy) ch.finish(false, "")
     }
 
     Socket {
@@ -147,11 +199,8 @@ Item {
         splitMarker: "\n"
         onRead: function(line) {
           if (!ch.busy) return
-          var parsed = null
-          try {
-            parsed = JSON.parse(String(line))
-          } catch (e) {}
-          ch.finish(parsed !== null, parsed)
+          var text = String(line || "").trim()
+          ch.finish(text !== "", text)
         }
       }
 
@@ -162,15 +211,16 @@ Item {
           write(line + "\n")
           flush()
         } else if (!connected && ch.busy) {
+          var seq = ch.requestSeq
           // Defer one tick so a SplitParser.onRead arriving with EOF wins cleanly.
           Qt.callLater(function() {
-            if (ch.busy && !sock.connected) ch.finish(false, null)
+            if (ch.busy && ch.requestSeq === seq && !sock.connected) ch.finish(false, "")
           })
         }
       }
 
       onError: function() {
-        if (ch.busy) ch.finish(false, null)
+        if (ch.busy) ch.finish(false, "")
       }
     }
   }
@@ -178,19 +228,25 @@ Item {
   RpcChannel {
     id: stateChan
     socketPath: root.socketPath
-    onResponse: function(data) {
+    timeoutMs: 8000
+    onRawResponse: function(line) {
       root.stateLoading = false
-      if (data && data.ok) root.stateReceived(data)
+      root.stateReceived(line)
+      Qt.callLater(root._drainPendingStateFetch)
     }
-    onFailed: root.stateLoading = false
+    onFailed: {
+      root.stateLoading = false
+      Qt.callLater(root._drainPendingStateFetch)
+    }
   }
 
   RpcChannel {
     id: libraryChan
     socketPath: root.socketPath
-    onResponse: function(data) {
+    timeoutMs: 8000
+    onRawResponse: function(line) {
       root.libraryLoading = false
-      if (data && data.ok && root.isList(data.items)) root.libraryReceived(data.items)
+      root.libraryReceived(line)
     }
     onFailed: root.libraryLoading = false
   }
@@ -198,17 +254,23 @@ Item {
   RpcChannel {
     id: queueChan
     socketPath: root.socketPath
-    onResponse: function(data) {
+    timeoutMs: 8000
+    onRawResponse: function(line) {
       root.queueLoading = false
-      if (data && data.ok && root.isList(data.items)) root.queueReceived(data.items)
+      root.queueReceived(line)
+      Qt.callLater(root._drainPendingQueueFetch)
     }
-    onFailed: root.queueLoading = false
+    onFailed: {
+      root.queueLoading = false
+      Qt.callLater(root._drainPendingQueueFetch)
+    }
   }
 
   RpcChannel {
     id: cmdChan
     socketPath: root.socketPath
-    onResponse: function() {
+    timeoutMs: 5000
+    onRawResponse: function() {
       root.commandCompleted()
       Qt.callLater(root.drainCommands)
     }

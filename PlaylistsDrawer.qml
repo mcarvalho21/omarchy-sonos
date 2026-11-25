@@ -18,7 +18,7 @@ Item {
 
   readonly property int itemCount: controller.filteredLibrary.length
   readonly property real listDesiredHeight: itemCount > 0
-    ? (plList.contentHeight > 0 ? plList.contentHeight : itemCount * Style.space(48))
+    ? (itemCount * Style.space(44) + Math.max(0, itemCount - 1) * Style.space(4))
     : statusText.implicitHeight
   readonly property real desiredHeight: searchRow.implicitHeight + Style.space(8) + listDesiredHeight
 

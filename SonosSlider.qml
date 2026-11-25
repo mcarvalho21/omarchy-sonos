@@ -56,7 +56,7 @@ Item {
   Rectangle {
     id: fill
     anchors.verticalCenter: track.verticalCenter
-    anchors.left: track.left
+    x: root.mirrored ? (track.x + track.width - width) : track.x
     height: track.height
     radius: track.radius
     color: root.fillColor
@@ -119,6 +119,7 @@ Item {
     onPositionChanged: function(mouse) {
       if (!root.dragging) return
       var next = valueFromX(mouse.x)
+      if (next === root.liveValue) return
       root.liveValue = next
       root.moved(next)
     }
@@ -126,6 +127,11 @@ Item {
       if (mouse.button !== Qt.LeftButton) return
       root.dragging = false
       root.released(root.liveValue)
+      root.liveValue = root.value
+    }
+    onCanceled: {
+      if (!root.dragging) return
+      root.dragging = false
       root.liveValue = root.value
     }
     // Intentionally no onWheel handler: wheel/trackpad scroll events must always
