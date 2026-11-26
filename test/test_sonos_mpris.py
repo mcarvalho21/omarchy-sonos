@@ -6,9 +6,12 @@ from __future__ import annotations
 import concurrent.futures
 import http.client
 import importlib.util
+import os
 import pathlib
 import socket
+import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -491,6 +494,296 @@ class TestHttpPoolAndSoapBatching(unittest.TestCase):
         self.assertIsNone(sonos.find_group([g1, g2], "RINCON_GONE"))
         self.assertIsNone(sonos.find_group([], ""))
 
+    def test_seed_cache_persists_valid_private_ips_and_rtts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_file = os.path.join(tmp, "seeds.json")
+            sonos.save_cached_seeds(
+                ["192.168.4.62", "8.8.8.8", "192.168.4.71", "192.168.4.62"],
+                {"192.168.4.62": 92.4, "8.8.8.8": 10.0, "192.168.4.71": float("nan")},
+                path=cache_file,
+            )
+            mode = os.stat(cache_file).st_mode & 0o777
+            self.assertEqual(mode, 0o600)
+            ips, rtts = sonos.load_cached_seeds(path=cache_file)
+            self.assertEqual(ips, ["192.168.4.62", "192.168.4.71"])
+            self.assertEqual(rtts, {"192.168.4.62": 92.4})
+
+    def test_rtt_tracker_ranks_fastest_and_penalizes_failures(self) -> None:
+        rtt = sonos._RttTracker(alpha=0.5)
+        rtt.seed({"192.168.7.19": 390.0, "192.168.4.62": 95.0})
+        self.assertEqual(
+            rtt.rank(["192.168.7.19", "192.168.4.71", "192.168.4.62"]),
+            ["192.168.4.62", "192.168.7.19", "192.168.4.71"],
+        )
+        rtt.record_failure("192.168.4.62")
+        self.assertEqual(
+            rtt.rank(["192.168.4.62", "192.168.7.19"]),
+            ["192.168.7.19", "192.168.4.62"],
+        )
+
+    def test_discover_via_avahi_streams_and_exits_early(self) -> None:
+        r_fd, w_fd = os.pipe()
+        os.write(
+            w_fd,
+            b"+;wlan0;IPv4;Sonos;_sonos._tcp;local\n"
+            b"=;wlan0;IPv4;Sonos;_sonos._tcp;local;sonos.local;192.168.4.62;1400;\n",
+        )
+        # Leave write end open to verify discover_via_avahi exits via first_hit_grace without EOF.
+        r_file = os.fdopen(r_fd, "rb", buffering=0)
+
+        class FakeProc:
+            def __init__(self) -> None:
+                self.stdout = r_file
+                self.terminated = False
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def wait(self, timeout=None) -> int:
+                return 0
+
+            def kill(self) -> None:
+                pass
+
+        fake_proc = FakeProc()
+        try:
+            with mock.patch.object(subprocess, "Popen", return_value=fake_proc):
+                ips = sonos.discover_via_avahi(timeout=2.0, first_hit_grace=0.03)
+            self.assertEqual(ips, ["192.168.4.62"])
+            self.assertTrue(fake_proc.terminated)
+        finally:
+            r_file.close()
+            os.close(w_fd)
+
+    def test_adaptive_batch_speculates_media_info_and_skips_idle_and_settings(self) -> None:
+        g_vli = sonos.ZoneGroup("RINCON_1", "192.168.4.10", "Kitchen", ("RINCON_1",), ("Kitchen",))
+        g_idle = sonos.ZoneGroup("RINCON_2", "192.168.4.11", "Porch", ("RINCON_2",), ("Porch",))
+        calls: list[tuple[str, str]] = []
+
+        def fake_soap(ip: str, _path: str, _service: str, action: str, _body: str = "") -> str:
+            calls.append((ip, action))
+            if action == "GetTransportInfo":
+                return (
+                    "<r><CurrentTransportState>PAUSED_PLAYBACK</CurrentTransportState></r>"
+                    if ip == "192.168.4.10"
+                    else "<r><CurrentTransportState>STOPPED</CurrentTransportState></r>"
+                )
+            if action == "GetPositionInfo":
+                if ip == "192.168.4.10":
+                    return "<r><TrackURI>x-sonos-vli:RINCON_1:2,spotify:1</TrackURI><TrackMetaData></TrackMetaData></r>"
+                return "<r><TrackURI></TrackURI><TrackMetaData></TrackMetaData></r>"
+            if action == "GetMediaInfo":
+                if ip == "192.168.4.10":
+                    return (
+                        "<r><CurrentURI>x-sonos-vli:RINCON_1:2,spotify:1</CurrentURI>"
+                        "<CurrentURIMetaData>&lt;DIDL-Lite xmlns:dc=&quot;http://purl.org/dc/elements/1.1/&quot;&gt;"
+                        "&lt;item&gt;&lt;dc:title&gt;Spotify&lt;/dc:title&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;</CurrentURIMetaData></r>"
+                    )
+                return "<r><CurrentURI></CurrentURI><CurrentURIMetaData></CurrentURIMetaData></r>"
+            if action == "GetTransportSettings":
+                return "<r><PlayMode>REPEAT_ALL</PlayMode></r>"
+            if action == "GetVolume":
+                return "<r><CurrentVolume>20</CurrentVolume></r>"
+            if action == "GetMute":
+                return "<r><CurrentMute>0</CurrentMute></r>"
+            return "<r/>"
+
+        hints: set[str] = set()
+        with (
+            mock.patch.object(sonos, "soap_call", side_effect=fake_soap),
+            concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex,
+        ):
+            states1, _, _ = sonos.fetch_groups_batch(
+                [g_vli, g_idle], [], ex, include_speakers=False, media_info_hints=hints
+            )
+            self.assertEqual(states1["RINCON_1"].title, "Spotify")
+            self.assertIn("RINCON_1", hints)
+            self.assertEqual(states1["RINCON_2"].repeat, "all")
+
+            # Second poll with prev_states + hints: Porch skips GetMediaInfo AND GetTransportSettings.
+            calls.clear()
+            states2, _, _ = sonos.fetch_groups_batch(
+                [g_vli, g_idle],
+                [],
+                ex,
+                include_speakers=False,
+                prev_states=states1,
+                media_info_hints=hints,
+                selected_coord_uuid="RINCON_1",
+                refresh_all_settings=False,
+            )
+
+        self.assertEqual(states2["RINCON_1"].title, "Spotify")
+        self.assertEqual(states2["RINCON_2"].repeat, "all")
+        porch_actions = {act for ip, act in calls if ip == "192.168.4.11"}
+        self.assertNotIn("GetMediaInfo", porch_actions)
+        self.assertNotIn("GetTransportSettings", porch_actions)
+
+    def test_browse_content_directory_requests_200_in_single_batch(self) -> None:
+        bodies: list[str] = []
+
+        def fake_soap(_ip: str, _path: str, _service: str, _action: str, body: str = "") -> str:
+            bodies.append(body)
+            return "<r><NumberReturned>0</NumberReturned><TotalMatches>0</TotalMatches><Result></Result></r>"
+
+        with mock.patch.object(sonos, "soap_call", side_effect=fake_soap):
+            sonos.browse_content_directory("192.168.4.62", "Q:0", limit=200, minimal=True)
+        self.assertEqual(len(bodies), 1)
+        self.assertIn("<RequestedCount>200</RequestedCount>", bodies[0])
+
+
+class TestGenaEventsAndAutoDetect(unittest.TestCase):
+    def test_parse_gena_topology_group_rc_and_rc_events(self) -> None:
+        topo_xml = (
+            '<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property>'
+            "<ZoneGroupState>"
+            + sonos.xml_escape(
+                '<ZoneGroupState><ZoneGroups>'
+                '<ZoneGroup Coordinator="RINCON_A" ID="RINCON_A:1">'
+                '<ZoneGroupMember UUID="RINCON_A" ZoneName="Office" Location="http://192.168.4.71:1400/xml/device_description.xml"/>'
+                "</ZoneGroup></ZoneGroups></ZoneGroupState>"
+            )
+            + "</ZoneGroupState></e:property></e:propertyset>"
+        )
+        parsed = sonos.parse_gena_topology_event(topo_xml)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual([g.coord_name for g in parsed[0]], ["Office"])
+
+        grc_xml = (
+            '<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">'
+            "<e:property><GroupVolume>37</GroupVolume></e:property>"
+            "<e:property><GroupMute>1</GroupMute></e:property>"
+            "</e:propertyset>"
+        )
+        self.assertEqual(sonos.parse_gena_group_rc_event(grc_xml), (37, True))
+
+        rc_last_change = (
+            '<Event xmlns="urn:schemas-upnp-org:metadata-1-0/RCS/">'
+            '<InstanceID val="0">'
+            '<Volume channel="LF" val="99"/>'
+            '<Volume channel="Master" val="28"/>'
+            '<Mute channel="LF" val="1"/>'
+            '<Mute channel="Master" val="0"/>'
+            "</InstanceID></Event>"
+        )
+        rc_xml = (
+            '<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">'
+            f"<e:property><LastChange>{sonos.xml_escape(rc_last_change)}</LastChange></e:property>"
+            "</e:propertyset>"
+        )
+        self.assertEqual(sonos.parse_gena_rc_event(rc_xml), (28, False))
+
+    def test_parse_gena_avtransport_full_and_partial_last_change(self) -> None:
+        didl = (
+            '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" '
+            'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
+            'xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">'
+            "<item><dc:title>Silver Pearl</dc:title><dc:creator>Artist X</dc:creator>"
+            "<upnp:album>Album Y</upnp:album></item></DIDL-Lite>"
+        )
+        full_lc = (
+            '<Event xmlns="urn:schemas-upnp-org:metadata-1-0/AVT/">'
+            '<InstanceID val="0">'
+            '<TransportState val="PLAYING"/>'
+            '<CurrentPlayMode val="SHUFFLE"/>'
+            '<CurrentTrack val="3"/>'
+            '<CurrentTrackDuration val="0:04:20"/>'
+            '<CurrentTrackURI val="x-sonos-vli:RINCON_1:2,spotify:1"/>'
+            f'<CurrentTrackMetaData val="{sonos.xml_escape(didl)}"/>'
+            '<NumberOfTracks val="12"/>'
+            "</InstanceID></Event>"
+        )
+        full_xml = (
+            '<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">'
+            f"<e:property><LastChange>{sonos.xml_escape(full_lc)}</LastChange></e:property>"
+            "</e:propertyset>"
+        )
+        st, need_pos, q_changed = sonos.parse_gena_avtransport_event(
+            "192.168.4.62", full_xml, None
+        )
+        self.assertIsNotNone(st)
+        assert st is not None
+        self.assertEqual(st.playback_status, "Playing")
+        self.assertEqual(st.title, "Silver Pearl")
+        self.assertEqual(st.artist, "Artist X")
+        self.assertEqual(st.source_name, "Spotify Connect")
+        self.assertEqual(st.duration_sec, 260)
+        self.assertEqual(st.track_num, 3)
+        self.assertTrue(st.shuffle)
+        self.assertEqual(st.repeat, "all")
+        self.assertTrue(need_pos)
+        self.assertTrue(q_changed)
+
+        # Partial event with only TransportState must preserve existing title/artist/source.
+        partial_lc = (
+            '<Event xmlns="urn:schemas-upnp-org:metadata-1-0/AVT/">'
+            '<InstanceID val="0"><TransportState val="PAUSED_PLAYBACK"/></InstanceID></Event>'
+        )
+        partial_xml = (
+            '<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">'
+            f"<e:property><LastChange>{sonos.xml_escape(partial_lc)}</LastChange></e:property>"
+            "</e:propertyset>"
+        )
+        st2, need_pos2, q_changed2 = sonos.parse_gena_avtransport_event(
+            "192.168.4.62", partial_xml, st
+        )
+        assert st2 is not None
+        self.assertEqual(st2.playback_status, "Paused")
+        self.assertEqual(st2.title, "Silver Pearl")
+        self.assertEqual(st2.source_name, "Spotify Connect")
+        self.assertTrue(need_pos2)
+        self.assertFalse(q_changed2)
+
+    def test_gena_http_server_validates_sid_and_accepts_notify(self) -> None:
+        received: list[tuple[str, str]] = []
+        mgr = sonos._GenaManager(on_event=lambda sub, body: received.append((sub.sid, body)))
+        try:
+            with mock.patch.dict(os.environ, {"MC_SONOS_GENA_PORT": "0"}):
+                self.assertTrue(mgr._start_server("127.0.0.1"))
+            parsed = sonos.urllib.parse.urlparse(mgr.callback_url)
+            port = parsed.port
+            assert port
+
+            # Unknown SID must be rejected with 412 Precondition Failed.
+            c1 = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+            c1.request("NOTIFY", "/notify", body=b"<x/>", headers={"SID": "uuid:bogus"})
+            r1 = c1.getresponse()
+            r1.read()
+            c1.close()
+            self.assertEqual(r1.status, 412)
+
+            # Register a valid SID and send NOTIFY -> 200 OK + callback invoked.
+            sub = sonos._GenaSub("uuid:valid-1", "192.168.4.62", "/Event", "group_rc", "RINCON_A", 9999999999.0)
+            with mgr._lock:
+                mgr._subs[sub.sid] = sub
+            c2 = http.client.HTTPConnection("127.0.0.1", port, timeout=2.0)
+            c2.request("NOTIFY", "/notify", body=b"<ok/>", headers={"SID": "uuid:valid-1"})
+            r2 = c2.getresponse()
+            r2.read()
+            c2.close()
+            self.assertEqual(r2.status, 200)
+            self.assertTrue(mgr._first_notify.is_set())
+            self.assertEqual(received, [("uuid:valid-1", "<ok/>")])
+        finally:
+            mgr.shutdown()
+
+    def test_gena_probe_falls_back_cleanly_when_notify_blocked(self) -> None:
+        mgr = sonos._GenaManager(on_event=lambda _s, _b: None)
+        fake_sub = sonos._GenaSub("uuid:probe-1", "192.168.4.62", "/ZoneGroupTopology/Event", "topology", "192.168.4.62", 9999999999.0)
+        with (
+            mock.patch.dict(os.environ, {"MC_SONOS_GENA_PORT": "0"}),
+            mock.patch.object(sonos, "detect_local_ip_for", return_value="127.0.0.1"),
+            mock.patch.object(mgr, "_subscribe", return_value=fake_sub),
+            mock.patch.object(mgr, "_unsubscribe") as unsub,
+        ):
+            ok = mgr.probe("192.168.4.62", wait_sec=0.05)
+        self.assertFalse(ok)
+        self.assertFalse(mgr.active)
+        self.assertEqual(mgr.state, "unavailable")
+        self.assertIsNone(mgr._server)
+        unsub.assert_called_once()
+
 
 class TestQmlUiSafetyAndScrollBehavior(unittest.TestCase):
     def test_no_panel_slider_wheel_hijack_in_plugin_qml(self) -> None:
@@ -543,6 +836,15 @@ class TestQmlUiSafetyAndScrollBehavior(unittest.TestCase):
         rpc_qml = (PLUGIN_DIR / "SonosRpc.qml").read_text(encoding="utf-8")
         self.assertIn("delete _pendingVolumes[volKey]", rpc_qml)
         self.assertIn("requestSeq", rpc_qml)
+        self.assertIn('{"cmd":"subscribe"}', rpc_qml)
+        self.assertIn("commandCompleted(", rpc_qml)
+
+        self.assertIn("subscribed: root.opened", panel_qml)
+        self.assertIn("genaActive", panel_qml)
+        self.assertIn("coordUuid: target", panel_qml)
+
+        queue_qml = (PLUGIN_DIR / "QueueDrawer.qml").read_text(encoding="utf-8")
+        self.assertIn("fetchQueue(true)", queue_qml)
 
 
 if __name__ == "__main__":

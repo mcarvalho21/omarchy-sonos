@@ -54,6 +54,9 @@ Panel {
   property var libraryItems: []
   property var queueItems: []
   property string queueCoordUuid: ""
+  property bool genaActive: false
+  property string _pendingRefreshCoord: ""
+  property bool _pendingRefreshFull: false
   property int livePositionSec: 0
   property double lastSeekMs: 0
   property double _lastStateAtMs: 0
@@ -63,6 +66,7 @@ Panel {
   readonly property bool stateLoading: rpc.stateLoading
   readonly property bool libraryLoading: rpc.libraryLoading
   readonly property bool queueLoading: rpc.queueLoading
+  readonly property bool needsMemberAudio: (expanded && activeTab === "speakers") || memberVolumesShown
 
   // Unified keyboard + mouse cursor model (matches omarchy.audio / omarchy.bluetooth):
   //   focusSection: "master" | "drawer"
@@ -436,27 +440,28 @@ Panel {
     }
   }
 
-  function fetchState(forceTopology) {
-    rpc.fetchState(forceTopology, groups.length === 0)
+  function fetchState(forceTopology, opts) {
+    var options = opts || ({})
+    if (options.selectedCoordUuid === undefined && activeGroup)
+      options.selectedCoordUuid = activeGroup.coord_uuid
+    rpc.fetchState(forceTopology, groups.length === 0, options)
   }
 
   function sendCommand(payload) {
     rpc.sendCommand(payload)
-    if (opened) postCommandRefresh.restart()
   }
 
   function queueVolumeChange(payload) {
     rpc.queueVolumeChange(payload)
-    if (opened) postCommandRefresh.restart()
   }
 
   function fetchLibrary(force) {
     rpc.fetchLibrary(force)
   }
 
-  function fetchQueue() {
+  function fetchQueue(force) {
     if (!activeGroup) return
-    rpc.fetchQueue(activeGroup.coord_uuid, queueLimit)
+    rpc.fetchQueue(activeGroup.coord_uuid, queueLimit, !!force)
   }
 
   function refresh() {
@@ -469,14 +474,17 @@ Panel {
       focusSection = "master"
       selectedIndex = -1
       resetPointerGate()
-      fetchState(false)
+      // Persistent event stream pushes cached state in <1ms; follow with a live 1-wave refresh.
+      fetchState(false, { includeSpeakers: true })
       if (expanded) {
         if (activeTab === "playlists" && libraryItems.length === 0) fetchLibrary(false)
-        if (activeTab === "queue" && activeGroup) fetchQueue()
+        if (activeTab === "queue" && activeGroup) fetchQueue(false)
       }
       Qt.callLater(resetActiveDrawerScroll)
     } else {
       postCommandRefresh.stop()
+      _pendingRefreshCoord = ""
+      _pendingRefreshFull = false
       rpc.flushPendingVolume()
       hideMemberVolumes()
       groupVolumePreview = ({})
@@ -492,15 +500,17 @@ Panel {
       selectedIndex = -1
       return
     }
+    if (activeTab === "speakers") fetchState(false, { includeSpeakers: true })
     if (activeTab === "playlists" && libraryItems.length === 0) fetchLibrary(false)
-    if (activeTab === "queue" && activeGroup) fetchQueue()
+    if (activeTab === "queue" && activeGroup) fetchQueue(false)
     clampCursor()
   }
 
   onActiveTabChanged: {
     if (!opened || !expanded) return
+    if (activeTab === "speakers") fetchState(false, { includeSpeakers: true })
     if (activeTab === "playlists" && libraryItems.length === 0) fetchLibrary(false)
-    if (activeTab === "queue" && activeGroup) fetchQueue()
+    if (activeTab === "queue" && activeGroup) fetchQueue(false)
     clampCursor()
     resetActiveDrawerScroll()
   }
@@ -510,7 +520,7 @@ Panel {
     groupVolumePreview = ({})
     queueCoordUuid = ""
     queueItems = []
-    if (opened && expanded && activeTab === "queue") fetchQueue()
+    if (opened && expanded && activeTab === "queue") fetchQueue(false)
   }
 
   onPlaylistQueryChanged: clampCursor()
@@ -518,11 +528,13 @@ Panel {
 
   SonosRpc {
     id: rpc
+    subscribed: root.opened
 
     onStateReceived: function(rawJson) {
       var data = null
       try { data = JSON.parse(rawJson) } catch (e) { return }
       if (!data || !data.ok) return
+      root.genaActive = !!data.gena_active
       if (Array.isArray(data.groups)) root.groups = data.groups
       if (Array.isArray(data.speakers)) root.speakers = data.speakers
       // Real values replace the estimate once no change is in flight.
@@ -538,11 +550,11 @@ Panel {
         if (trackChanged || (Date.now() - root.lastSeekMs > 1000))
           root.livePositionSec = root.activeGroup.position_sec || 0
       }
-      root._lastStateAtMs = Date.now()
+      if (!data.cached) root._lastStateAtMs = Date.now()
       root.clampCursor()
       if (root.opened && root.expanded && root.activeTab === "queue" && root.activeGroup
           && root.queueCoordUuid !== root.activeGroup.coord_uuid)
-        root.fetchQueue()
+        root.fetchQueue(false)
     }
 
     onLibraryReceived: function(rawJson) {
@@ -562,17 +574,36 @@ Panel {
       root.queueCoordUuid = data.coord_uuid || (root.activeGroup ? root.activeGroup.coord_uuid : "")
       root.clampCursor()
     }
+
+    onCommandCompleted: function(cmd, coordUuid) {
+      if (!root.opened) return
+      if (cmd === "join_group" || cmd === "leave_group") {
+        root._pendingRefreshFull = true
+        root._pendingRefreshCoord = ""
+        postCommandRefresh.interval = 220
+        postCommandRefresh.restart()
+        return
+      }
+      // When GENA push is active, Sonos pushes confirmed updates automatically;
+      // otherwise do a fast targeted single-group refresh right after the command.
+      if (root.genaActive) return
+      var target = coordUuid || (root.activeGroup ? root.activeGroup.coord_uuid : "")
+      root._pendingRefreshCoord = target
+      postCommandRefresh.interval = 100
+      postCommandRefresh.restart()
+    }
   }
 
-  // On-demand RPC polling ONLY while the panel is open (zero idle work when closed).
+  // On-demand RPC polling ONLY while the panel is open (slows to a 15s safety
+  // heartbeat when GENA push events are active; zero idle work when closed).
   Timer {
     id: openPollTimer
-    interval: root.pollIntervalSec * 1000
+    interval: root.genaActive ? 15000 : (root.pollIntervalSec * 1000)
     running: root.opened
     repeat: true
     onTriggered: {
-      if (Date.now() - root._lastStateAtMs >= (root.pollIntervalSec * 1000 - 300))
-        root.fetchState(false)
+      if (Date.now() - root._lastStateAtMs >= (interval - 300))
+        root.fetchState(false, { includeSpeakers: root.needsMemberAudio })
     }
   }
 
@@ -592,14 +623,33 @@ Panel {
     id: memberVolumeSettle
     interval: 1200
     repeat: false
-    onTriggered: if (root.opened) root.fetchState(false)
+    onTriggered: {
+      if (!root.opened) return
+      if (root.activeGroup)
+        root.fetchState(false, { coordUuid: root.activeGroup.coord_uuid, includeSpeakers: true })
+      else
+        root.fetchState(false, { includeSpeakers: true })
+    }
   }
 
   Timer {
     id: postCommandRefresh
-    interval: 300
+    interval: 100
     repeat: false
-    onTriggered: if (root.opened) root.fetchState(false)
+    onTriggered: {
+      if (!root.opened) return
+      var full = root._pendingRefreshFull
+      var target = root._pendingRefreshCoord
+      root._pendingRefreshFull = false
+      root._pendingRefreshCoord = ""
+      if (full) {
+        root.fetchState(true, { includeSpeakers: true })
+      } else if (target !== "") {
+        root.fetchState(false, { coordUuid: target, includeSpeakers: root.needsMemberAudio })
+      } else {
+        root.fetchState(false, { includeSpeakers: root.needsMemberAudio })
+      }
+    }
   }
 
   Timer {

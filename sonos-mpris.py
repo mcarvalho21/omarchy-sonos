@@ -21,10 +21,13 @@ import ctypes
 import fcntl
 import html
 import http.client
+import http.server
 import ipaddress
 import json
+import math
 import os
 import re
+import selectors
 import signal
 import socket
 import subprocess
@@ -48,6 +51,7 @@ NS_R = "{urn:schemas-rinconnetworks-com:metadata-1-0/}"
 MAX_HTTP_BYTES = 1024 * 1024
 MAX_DIDL_METADATA_BYTES = 16384
 MAX_IDLE_CONNS_PER_IP = 6
+SEED_CACHE_MAX_IPS = 32
 HTTP_TIMEOUT = 2.5
 DISCOVERY_INTERVAL = 60.0
 FORCE_DISCOVERY_MIN_INTERVAL = 5.0
@@ -56,8 +60,14 @@ TOPOLOGY_IDLE_INTERVAL = 60.0
 POLL_ACTIVE_INTERVAL = 2.0
 POLL_IDLE_INTERVAL = 30.0
 IDLE_SWEEP_INTERVAL = 30.0
+SETTINGS_REFRESH_INTERVAL = 10.0
 LIBRARY_CACHE_TTL = 45.0
+QUEUE_CACHE_TTL = 15.0
 SERVICE_CACHE_RETRY_INTERVAL = 60.0
+GENA_DEFAULT_PORT = 14001
+GENA_SUB_TIMEOUT_SEC = 1800
+GENA_PROBE_WAIT_SEC = 2.5
+GENA_HEARTBEAT_INTERVAL = 60.0
 
 
 def runtime_dir() -> str:
@@ -74,6 +84,134 @@ def socket_file_path() -> str:
 
 def lock_file_path() -> str:
     return os.path.join(runtime_dir(), "mc-sonos.lock")
+
+
+def seed_cache_path() -> str:
+    cache_home = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    if cache_home and os.path.isdir(os.path.dirname(cache_home)):
+        return os.path.join(cache_home, "mc-sonos-seeds.json")
+    return os.path.join(runtime_dir(), "mc-sonos-seeds.json")
+
+
+def load_cached_seeds(path: str | None = None) -> tuple[list[str], dict[str, float]]:
+    target = path or seed_cache_path()
+    try:
+        with open(target, "r", encoding="utf-8") as fh:
+            data = json.loads(fh.read(32768))
+    except (OSError, ValueError):
+        return [], {}
+    if not isinstance(data, dict):
+        return [], {}
+    ips: list[str] = []
+    seen: set[str] = set()
+    raw_ips = data.get("ips")
+    if isinstance(raw_ips, list):
+        for item in raw_ips:
+            if isinstance(item, str) and is_valid_private_ipv4(item) and item not in seen:
+                seen.add(item)
+                ips.append(item)
+                if len(ips) >= SEED_CACHE_MAX_IPS:
+                    break
+    rtts: dict[str, float] = {}
+    raw_rtts = data.get("rtts")
+    if isinstance(raw_rtts, dict):
+        for ip, ms in raw_rtts.items():
+            if (
+                isinstance(ip, str)
+                and is_valid_private_ipv4(ip)
+                and isinstance(ms, (int, float))
+                and math.isfinite(ms)
+                and 0.5 <= float(ms) <= 10000.0
+            ):
+                rtts[ip] = float(ms)
+    return ips, rtts
+
+
+def save_cached_seeds(
+    ips: list[str], rtts: dict[str, float], path: str | None = None
+) -> None:
+    clean_ips: list[str] = []
+    seen: set[str] = set()
+    for ip in ips:
+        if is_valid_private_ipv4(ip) and ip not in seen:
+            seen.add(ip)
+            clean_ips.append(ip)
+            if len(clean_ips) >= SEED_CACHE_MAX_IPS:
+                break
+    if not clean_ips:
+        return
+    clean_rtts = {
+        ip: round(float(ms), 1)
+        for ip, ms in rtts.items()
+        if ip in seen and math.isfinite(ms) and 0.5 <= float(ms) <= 10000.0
+    }
+    target = path or seed_cache_path()
+    parent = os.path.dirname(target)
+    tmp = f"{target}.tmp.{os.getpid()}"
+    try:
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(
+                fd,
+                json.dumps({"ips": clean_ips, "rtts": clean_rtts}).encode("utf-8"),
+            )
+        finally:
+            os.close(fd)
+        os.replace(tmp, target)
+    except OSError:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+
+
+class _RttTracker:
+    """Thread-safe EWMA latency tracker used to route topology/library to the fastest speaker."""
+
+    def __init__(self, alpha: float = 0.35) -> None:
+        self._alpha = alpha
+        self._lock = threading.Lock()
+        self._ewma: dict[str, float] = {}
+
+    def seed(self, rtts: dict[str, float]) -> None:
+        with self._lock:
+            for ip, ms in rtts.items():
+                if ip not in self._ewma and math.isfinite(ms) and ms > 0:
+                    self._ewma[ip] = float(ms)
+
+    def record(self, ip: str, elapsed_ms: float) -> None:
+        if not ip or not math.isfinite(elapsed_ms) or elapsed_ms < 0:
+            return
+        sample = max(0.5, min(10000.0, float(elapsed_ms)))
+        with self._lock:
+            prev = self._ewma.get(ip)
+            self._ewma[ip] = (
+                sample
+                if prev is None
+                else (self._alpha * sample + (1.0 - self._alpha) * prev)
+            )
+
+    def record_failure(self, ip: str) -> None:
+        if not ip:
+            return
+        with self._lock:
+            prev = self._ewma.get(ip, 500.0)
+            self._ewma[ip] = min(10000.0, max(1500.0, prev * 2.0))
+
+    def rank(self, ips: list[str]) -> list[str]:
+        with self._lock:
+            snap = dict(self._ewma)
+        return sorted(ips, key=lambda ip: snap.get(ip, 500.0))
+
+    def snapshot(self) -> dict[str, float]:
+        with self._lock:
+            return dict(self._ewma)
+
+
+_RTT = _RttTracker()
 
 
 def set_parent_death_signal() -> None:
@@ -221,33 +359,86 @@ def soap_call(ip: str, path: str, service: str, action: str, body: str = "") -> 
         "Connection": "keep-alive",
         "Content-Length": str(len(payload)),
     }
-    return _HTTP_POOL.post(ip, path, headers, payload)
+    t0 = time.monotonic()
+    try:
+        resp = _HTTP_POOL.post(ip, path, headers, payload)
+    except Exception:
+        _RTT.record_failure(ip)
+        raise
+    _RTT.record(ip, (time.monotonic() - t0) * 1000.0)
+    return resp
 
 
-def discover_via_avahi() -> list[str]:
+def discover_via_avahi(
+    timeout: float = 3.5, first_hit_grace: float = 0.08
+) -> list[str]:
+    """Stream avahi-browse and return shortly after the first valid Sonos IPv4.
+
+    A single speaker IP is enough for GetZoneGroupState to discover the whole house,
+    so returning right after the cached mDNS burst avoids avahi-browse -t's ~1s wait.
+    Uses raw unbuffered os.read() with selectors so buffered lines are never missed.
+    """
     ips: list[str] = []
     seen: set[str] = set()
     try:
-        proc = subprocess.run(
-            ["avahi-browse", "-rtpk", "_sonos._tcp"],
-            capture_output=True,
-            text=True,
-            timeout=4,
-            check=False,
+        proc = subprocess.Popen(
+            ["avahi-browse", "-rpk", "_sonos._tcp"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError:
         return ips
 
-    for line in proc.stdout.splitlines():
-        if not line.startswith("=;"):
-            continue
-        fields = line.split(";")
-        if len(fields) < 8:
-            continue
-        ip = fields[7].strip()
-        if is_valid_private_ipv4(ip) and ip not in seen:
-            seen.add(ip)
-            ips.append(ip)
+    sel = selectors.DefaultSelector()
+    try:
+        if proc.stdout is None:
+            return ips
+        fd = proc.stdout.fileno()
+        sel.register(fd, selectors.EVENT_READ)
+        deadline = time.monotonic() + max(0.2, timeout)
+        buf = b""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            events = sel.select(timeout=remaining)
+            if not events:
+                break
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                raw_line, buf = buf.split(b"\n", 1)
+                line = raw_line.decode("utf-8", "replace")
+                if not line.startswith("=;"):
+                    continue
+                fields = line.split(";")
+                if len(fields) < 8:
+                    continue
+                ip = fields[7].strip()
+                if is_valid_private_ipv4(ip) and ip not in seen:
+                    seen.add(ip)
+                    ips.append(ip)
+                    if len(ips) == 1:
+                        deadline = min(deadline, time.monotonic() + first_hit_grace)
+    except OSError:
+        pass
+    finally:
+        try:
+            sel.close()
+        except Exception:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=0.5)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=0.5)
+            except Exception:
+                pass
     return ips
 
 
@@ -740,10 +931,13 @@ def _assemble_track_state(
     vol_xml: str | None,
     mute_xml: str | None,
     include_audio: bool,
+    *,
+    pos_parsed: tuple[str, str, str, str, str, int, int, int] | None = None,
+    fallback_play_mode: tuple[bool, str] | None = None,
 ) -> TrackState:
     ip = group.coord_ip
     title, artist, album, art_url, track_uri, duration_sec, position_sec, track_num = (
-        _parse_position_info(ip, pos_xml)
+        pos_parsed if pos_parsed is not None else _parse_position_info(ip, pos_xml)
     )
     current_uri = ""
     if media_xml:
@@ -761,7 +955,12 @@ def _assemble_track_state(
             title = "TV Audio" if "htastream" in track_uri else "Line-In"
 
     source_name, source_icon = detect_audio_source(ip, track_uri, current_uri)
-    shuffle, repeat = _parse_play_mode_xml(settings_xml)
+    if settings_xml is not None:
+        shuffle, repeat = _parse_play_mode_xml(settings_xml)
+    elif fallback_play_mode is not None:
+        shuffle, repeat = fallback_play_mode
+    else:
+        shuffle, repeat = False, "none"
     group_vol = _parse_int_tag(vol_xml, "CurrentVolume") if include_audio else 0
     group_muted = _parse_bool_tag(mute_xml, "CurrentMute") if include_audio else False
 
@@ -793,7 +992,11 @@ def _soap_safe(ip: str, path: str, service: str, action: str, body: str = "") ->
 
 
 def _submit_group_detail_calls(
-    pool: concurrent.futures.ThreadPoolExecutor, group: ZoneGroup
+    pool: concurrent.futures.ThreadPoolExecutor,
+    group: ZoneGroup,
+    *,
+    include_settings: bool = True,
+    include_media: bool = False,
 ) -> dict[str, concurrent.futures.Future[str | None]]:
     ip = group.coord_ip
     futs: dict[str, concurrent.futures.Future[str | None]] = {
@@ -805,15 +1008,25 @@ def _submit_group_detail_calls(
             "GetPositionInfo",
             "<InstanceID>0</InstanceID>",
         ),
-        "settings": pool.submit(
+    }
+    if include_settings:
+        futs["settings"] = pool.submit(
             _soap_safe,
             ip,
             "/MediaRenderer/AVTransport/Control",
             "AVTransport",
             "GetTransportSettings",
             "<InstanceID>0</InstanceID>",
-        ),
-    }
+        )
+    if include_media:
+        futs["media"] = pool.submit(
+            _soap_safe,
+            ip,
+            "/MediaRenderer/AVTransport/Control",
+            "AVTransport",
+            "GetMediaInfo",
+            "<InstanceID>0</InstanceID>",
+        )
     if len(group.member_uuids) > 1:
         futs["vol"] = pool.submit(
             _soap_safe,
@@ -858,12 +1071,17 @@ def fetch_groups_batch(
     *,
     include_speakers: bool = True,
     known_active_uuids: set[str] | None = None,
+    prev_states: dict[str, TrackState] | None = None,
+    media_info_hints: set[str] | None = None,
+    selected_coord_uuid: str = "",
+    refresh_all_settings: bool = True,
 ) -> tuple[dict[str, TrackState], dict[str, tuple[int, bool]], bool]:
     """Fetch group states (and optionally per-speaker audio) using flat leaf SOAP calls.
 
     When known_active_uuids is None, fetches full details and audio for every group
-    in a single parallel batch. When provided, only queries GetTransportInfo for
-    unknown/idle groups and fetches full details + audio only if they are active.
+    in a single parallel batch. Speculatively includes GetMediaInfo in Phase 1 for
+    groups in media_info_hints and skips redundant GetMediaInfo on already-stopped
+    idle rooms, collapsing multi-wave polling into 1 LAN round-trip.
     """
     group_states: dict[str, TrackState] = {}
     speaker_audio: dict[str, tuple[int, bool]] = {}
@@ -885,7 +1103,20 @@ def fetch_groups_batch(
             "<InstanceID>0</InstanceID>",
         )
         if full_all or (known_active_uuids is not None and g.coord_uuid in known_active_uuids):
-            detail_futs[g.coord_uuid] = _submit_group_detail_calls(pool, g)
+            has_prev = prev_states is not None and g.coord_uuid in prev_states
+            need_settings = (
+                refresh_all_settings
+                or not selected_coord_uuid
+                or g.coord_uuid == selected_coord_uuid
+                or not has_prev
+            )
+            spec_media = media_info_hints is not None and g.coord_uuid in media_info_hints
+            detail_futs[g.coord_uuid] = _submit_group_detail_calls(
+                pool,
+                g,
+                include_settings=need_settings,
+                include_media=spec_media,
+            )
 
     single_coords = {g.coord_uuid for g in groups if len(g.member_uuids) == 1}
     speaker_futs: dict[
@@ -931,47 +1162,88 @@ def fetch_groups_batch(
             if status == "Stopped":
                 group_states[g.coord_uuid] = _stopped_track_state()
             else:
-                newly_active_details[g.coord_uuid] = _submit_group_detail_calls(pool, g)
+                spec_media = media_info_hints is not None and g.coord_uuid in media_info_hints
+                newly_active_details[g.coord_uuid] = _submit_group_detail_calls(
+                    pool, g, include_settings=True, include_media=spec_media
+                )
 
     detail_futs.update(newly_active_details)
 
-    # Collect detail responses and submit GetMediaInfo in parallel where needed.
-    collected: dict[str, tuple[str | None, str | None, str | None, str | None]] = {}
+    # Collect detail responses and only issue Phase 2 GetMediaInfo if not already fetched.
+    collected: dict[
+        str,
+        tuple[
+            tuple[str, str, str, str, str, int, int, int],
+            str | None,
+            str | None,
+            str | None,
+            str | None,
+        ],
+    ] = {}
     media_futs: dict[str, concurrent.futures.Future[str | None]] = {}
     for g in groups:
         if g.coord_uuid not in statuses or g.coord_uuid not in detail_futs:
             continue
         futs = detail_futs[g.coord_uuid]
         pos_xml = futs["pos"].result()
-        settings_xml = futs["settings"].result()
+        settings_xml = futs["settings"].result() if "settings" in futs else None
         vol_xml = futs["vol"].result()
         mute_xml = futs["mute"].result()
-        collected[g.coord_uuid] = (pos_xml, settings_xml, vol_xml, mute_xml)
-        title, _, _, _, track_uri, _, _, _ = _parse_position_info(g.coord_ip, pos_xml)
-        if not title or not track_uri:
-            media_futs[g.coord_uuid] = pool.submit(
-                _soap_safe,
-                g.coord_ip,
-                "/MediaRenderer/AVTransport/Control",
-                "AVTransport",
-                "GetMediaInfo",
-                "<InstanceID>0</InstanceID>",
-            )
+        media_xml_p1 = futs["media"].result() if "media" in futs else None
+        pos_parsed = _parse_position_info(g.coord_ip, pos_xml)
+        title, _, _, _, track_uri, _, _, _ = pos_parsed
+        collected[g.coord_uuid] = (pos_parsed, settings_xml, vol_xml, mute_xml, media_xml_p1)
+
+        needs_media = not title or not track_uri
+        prev = prev_states.get(g.coord_uuid) if prev_states else None
+        already_idle = (
+            statuses[g.coord_uuid] == "Stopped"
+            and not title
+            and not track_uri
+            and prev is not None
+            and prev.playback_status == "Stopped"
+            and not prev.title
+        )
+        if needs_media and not already_idle:
+            if "media" not in futs:
+                media_futs[g.coord_uuid] = pool.submit(
+                    _soap_safe,
+                    g.coord_ip,
+                    "/MediaRenderer/AVTransport/Control",
+                    "AVTransport",
+                    "GetMediaInfo",
+                    "<InstanceID>0</InstanceID>",
+                )
+            if media_info_hints is not None:
+                if statuses[g.coord_uuid] != "Stopped":
+                    media_info_hints.add(g.coord_uuid)
+                else:
+                    media_info_hints.discard(g.coord_uuid)
+        elif media_info_hints is not None:
+            media_info_hints.discard(g.coord_uuid)
 
     for g in groups:
         if g.coord_uuid not in collected:
             continue
-        pos_xml, settings_xml, vol_xml, mute_xml = collected[g.coord_uuid]
-        media_xml = media_futs[g.coord_uuid].result() if g.coord_uuid in media_futs else None
+        pos_parsed, settings_xml, vol_xml, mute_xml, media_xml_p1 = collected[g.coord_uuid]
+        media_xml = (
+            media_futs[g.coord_uuid].result()
+            if g.coord_uuid in media_futs
+            else media_xml_p1
+        )
+        prev = prev_states.get(g.coord_uuid) if prev_states else None
+        fallback_mode = (prev.shuffle, prev.repeat) if prev is not None else None
         group_states[g.coord_uuid] = _assemble_track_state(
             group=g,
             status=statuses[g.coord_uuid],
-            pos_xml=pos_xml,
+            pos_xml=None,
             media_xml=media_xml,
             settings_xml=settings_xml,
             vol_xml=vol_xml,
             mute_xml=mute_xml,
             include_audio=True,
+            pos_parsed=pos_parsed,
+            fallback_play_mode=fallback_mode,
         )
 
     if include_speakers:
@@ -1107,7 +1379,7 @@ def browse_content_directory(
 ) -> list[dict]:
     items: list[dict] = []
     start = 0
-    batch = min(100, max(1, limit))
+    batch = min(200, max(1, limit))
     while len(items) < limit:
         body = (
             f"<ObjectID>{xml_escape(object_id)}</ObjectID>"
@@ -1289,6 +1561,9 @@ def build_state_payload(
     speakers: list[SpeakerInfo],
     group_states: dict[str, TrackState],
     speaker_audio: dict[str, tuple[int, bool]],
+    *,
+    gena_active: bool = False,
+    cached: bool = False,
 ) -> dict:
     g_list = []
     for g in groups:
@@ -1338,6 +1613,8 @@ def build_state_payload(
     return {
         "ok": True,
         "timestamp": int(time.time()),
+        "gena_active": gena_active,
+        "cached": cached,
         "groups": g_list,
         "speakers": s_list,
     }
@@ -1376,6 +1653,597 @@ def find_group(groups: list[ZoneGroup], coord_uuid: str) -> ZoneGroup | None:
         if g.coord_uuid == coord_uuid:
             return g
     return None
+
+
+def detect_local_ip_for(peer_ip: str) -> str:
+    if not is_valid_private_ipv4(peer_ip):
+        return ""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect((peer_ip, 1400))
+        local_ip = sock.getsockname()[0]
+        return local_ip if is_valid_private_ipv4(local_ip) else ""
+    except OSError:
+        return ""
+    finally:
+        sock.close()
+
+
+def _xml_local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _parse_gena_properties(xml_body: str) -> dict[str, str]:
+    props: dict[str, str] = {}
+    if not xml_body:
+        return props
+    try:
+        root = ET.fromstring(xml_body)
+    except ET.ParseError:
+        return props
+    for prop in root:
+        if _xml_local(prop.tag) != "property":
+            continue
+        for child in prop:
+            props[_xml_local(child.tag)] = child.text or ""
+    return props
+
+
+def parse_gena_topology_event(
+    xml_body: str,
+) -> tuple[list[ZoneGroup], list[SpeakerInfo]] | None:
+    props = _parse_gena_properties(xml_body)
+    state_xml = props.get("ZoneGroupState", "")
+    if not state_xml:
+        return None
+    groups, speakers = parse_zone_group_state(state_xml)
+    return (groups, speakers) if groups else None
+
+
+def parse_gena_group_rc_event(xml_body: str) -> tuple[int | None, bool | None]:
+    props = _parse_gena_properties(xml_body)
+    vol: int | None = None
+    muted: bool | None = None
+    raw_vol = props.get("GroupVolume")
+    if raw_vol is not None:
+        try:
+            vol = max(0, min(100, int(raw_vol.strip())))
+        except ValueError:
+            pass
+    raw_mute = props.get("GroupMute")
+    if raw_mute is not None:
+        muted = raw_mute.strip() in ("1", "true", "True")
+    return vol, muted
+
+
+def parse_gena_rc_event(xml_body: str) -> tuple[int | None, bool | None]:
+    props = _parse_gena_properties(xml_body)
+    lc = props.get("LastChange", "")
+    if not lc:
+        return None, None
+    try:
+        lroot = ET.fromstring(lc)
+    except ET.ParseError:
+        return None, None
+    vol: int | None = None
+    muted: bool | None = None
+    for el in lroot.iter():
+        tag = _xml_local(el.tag)
+        if tag == "Volume" and el.attrib.get("channel") == "Master":
+            try:
+                vol = max(0, min(100, int(el.attrib.get("val", ""))))
+            except ValueError:
+                pass
+        elif tag == "Mute" and el.attrib.get("channel") == "Master":
+            val = (el.attrib.get("val") or "").strip()
+            if val != "":
+                muted = val in ("1", "true", "True")
+    return vol, muted
+
+
+def parse_gena_avtransport_event(
+    ip: str, xml_body: str, prev: TrackState | None
+) -> tuple[TrackState | None, bool, bool]:
+    """Parse an AVTransport GENA LastChange event onto prev TrackState.
+
+    Returns (updated_state, need_position_sync, queue_maybe_changed).
+    """
+    props = _parse_gena_properties(xml_body)
+    lc = props.get("LastChange", "")
+    if not lc:
+        return None, False, False
+    try:
+        lroot = ET.fromstring(lc)
+    except ET.ParseError:
+        return None, False, False
+
+    vals: dict[str, str] = {}
+    for el in lroot.iter():
+        if "val" in el.attrib:
+            vals[_xml_local(el.tag)] = el.attrib["val"]
+    if not vals:
+        return None, False, False
+
+    base = prev if prev is not None else _stopped_track_state()
+    status = base.playback_status
+    if "TransportState" in vals:
+        tstate = vals["TransportState"].strip()
+        if tstate in ("PLAYING", "TRANSITIONING"):
+            status = "Playing"
+        elif tstate == "PAUSED_PLAYBACK":
+            status = "Paused"
+        else:
+            status = "Stopped"
+
+    shuffle, repeat = base.shuffle, base.repeat
+    if "CurrentPlayMode" in vals:
+        shuffle, repeat = decode_play_mode(vals["CurrentPlayMode"])
+
+    track_num = base.track_num
+    if "CurrentTrack" in vals:
+        try:
+            track_num = max(0, int(vals["CurrentTrack"]))
+        except ValueError:
+            pass
+
+    duration_sec = base.duration_sec
+    if "CurrentTrackDuration" in vals:
+        duration_sec = parse_hms_to_sec(vals["CurrentTrackDuration"])
+
+    title = base.title
+    artist = base.artist
+    album = base.album
+    art_url = base.art_url
+    source_name = base.source_name
+    source_icon = base.source_icon
+    can_next = base.can_next
+    can_prev = base.can_prev
+
+    has_meta = (
+        "CurrentTrackMetaData" in vals or "AVTransportURIMetaData" in vals
+    )
+    has_uri = ("CurrentTrackURI" in vals) or ("AVTransportURI" in vals)
+    if has_meta or has_uri:
+        track_uri = (vals.get("CurrentTrackURI") or "").strip()
+        current_uri = (vals.get("AVTransportURI") or "").strip()
+        if has_meta:
+            t_title, t_artist, t_album, t_art = parse_didl_metadata(
+                ip, vals.get("CurrentTrackMetaData") or ""
+            )
+            m_title, m_artist, m_album, m_art = parse_didl_metadata(
+                ip, vals.get("AVTransportURIMetaData") or ""
+            )
+            title = t_title or m_title
+            artist = t_artist or m_artist
+            album = t_album or m_album
+            art_url = t_art or m_art
+        if has_uri:
+            can_next = can_prev = True
+            if track_uri.startswith(("x-sonos-htastream:", "x-rincon-stream:")):
+                can_next = False
+                can_prev = False
+                if not title:
+                    title = "TV Audio" if "htastream" in track_uri else "Line-In"
+            src_name, src_icon = detect_audio_source(ip, track_uri, current_uri)
+            if src_name or not (track_uri or current_uri):
+                source_name, source_icon = src_name, src_icon
+
+    track_changed = (title != base.title) or (track_num != base.track_num)
+    status_changed = status != base.playback_status
+    position_sec = 0 if track_changed else base.position_sec
+
+    updated = TrackState(
+        playback_status=status,
+        title=title[:256],
+        artist=artist[:256],
+        album=album[:256],
+        art_url=art_url[:1024],
+        source_name=source_name[:80],
+        source_icon=source_icon,
+        duration_sec=duration_sec,
+        position_sec=position_sec,
+        track_num=track_num,
+        shuffle=shuffle,
+        repeat=repeat,
+        group_volume=base.group_volume,
+        group_muted=base.group_muted,
+        can_next=can_next,
+        can_prev=can_prev,
+    )
+    need_pos_sync = track_changed or status_changed
+    queue_changed = ("NumberOfTracks" in vals) or ("AVTransportURI" in vals)
+    return updated, need_pos_sync, queue_changed
+
+
+@dataclass
+class _GenaSub:
+    sid: str
+    ip: str
+    path: str
+    kind: str  # topology | avtransport | group_rc | rc
+    target_uuid: str
+    expires_at: float
+
+    @property
+    def key(self) -> tuple[str, str, str, str]:
+        return (self.kind, self.ip, self.path, self.target_uuid)
+
+
+def _parse_gena_timeout(header_val: str | None) -> int:
+    if not header_val:
+        return GENA_SUB_TIMEOUT_SEC
+    m = re.search(r"Second-(\d+)", header_val, re.I)
+    if m:
+        return max(120, min(7200, int(m.group(1))))
+    return GENA_SUB_TIMEOUT_SEC
+
+
+class _GenaManager:
+    """Auto-detecting UPnP GENA event subscription listener.
+
+    Attempts a single ZoneGroupTopology SUBSCRIBE probe on startup. If the initial
+    NOTIFY reaches our LAN-bound HTTP listener (not blocked by UFW), GENA becomes
+    active and subscribes to all groups/speakers for real-time push updates. If UFW
+    drops the inbound NOTIFY, the listener shuts down cleanly and the daemon stays
+    on fast SOAP polling with zero open listening ports.
+    """
+
+    def __init__(self, on_event) -> None:
+        self._on_event = on_event
+        self._lock = threading.Lock()
+        self._state = "unprobed"  # unprobed | probing | active | unavailable
+        self._subs: dict[str, _GenaSub] = {}
+        self._server: http.server.ThreadingHTTPServer | None = None
+        self._server_thread: threading.Thread | None = None
+        self._callback_url = ""
+        self._first_notify = threading.Event()
+        self._last_notify_at = 0.0
+
+    @property
+    def active(self) -> bool:
+        with self._lock:
+            return self._state == "active"
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            return self._state
+
+    @property
+    def callback_url(self) -> str:
+        with self._lock:
+            return self._callback_url
+
+    def _start_server(self, local_ip: str) -> bool:
+        manager = self
+
+        class _GenaHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            timeout = 3.0
+
+            def log_message(self, _format: str, *_args) -> None:
+                return
+
+            def do_NOTIFY(self) -> None:  # noqa: N802
+                peer_ip = self.client_address[0] if self.client_address else ""
+                if not is_valid_private_ipv4(peer_ip):
+                    self.send_response(403)
+                    self.send_header("Content-Length", "0")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    return
+
+                sid = (self.headers.get("SID") or "").strip()
+                sub = manager.lookup_sid(sid)
+                if sub is None:
+                    self.send_response(412)
+                    self.send_header("Content-Length", "0")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    return
+
+                raw_len = self.headers.get("Content-Length")
+                try:
+                    length = int(raw_len) if raw_len is not None else 0
+                except ValueError:
+                    length = -1
+                if length < 0 or length > MAX_HTTP_BYTES:
+                    self.send_response(413 if length > MAX_HTTP_BYTES else 400)
+                    self.send_header("Content-Length", "0")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    return
+
+                body_bytes = self.rfile.read(length) if length > 0 else b""
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                manager._mark_notify()
+                try:
+                    manager._on_event(sub, body_bytes.decode("utf-8", "replace"))
+                except Exception:
+                    pass
+
+        class _GenaHTTPServer(http.server.ThreadingHTTPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        try:
+            pref_port = int(os.environ.get("MC_SONOS_GENA_PORT", str(GENA_DEFAULT_PORT)))
+        except ValueError:
+            pref_port = GENA_DEFAULT_PORT
+        pref_port = pref_port if 0 <= pref_port <= 65535 else GENA_DEFAULT_PORT
+
+        srv: http.server.ThreadingHTTPServer | None = None
+        for port in (pref_port, 0) if pref_port != 0 else (0,):
+            try:
+                srv = _GenaHTTPServer((local_ip, port), _GenaHandler)
+                break
+            except OSError:
+                continue
+        if srv is None:
+            return False
+
+        bound_port = srv.server_address[1]
+        with self._lock:
+            self._server = srv
+            self._callback_url = f"http://{local_ip}:{bound_port}/notify"
+
+        t = threading.Thread(
+            target=srv.serve_forever,
+            kwargs={"poll_interval": 0.5},
+            daemon=True,
+            name="sonos-gena-http",
+        )
+        t.start()
+        with self._lock:
+            self._server_thread = t
+        return True
+
+    def _stop_server(self) -> None:
+        with self._lock:
+            srv = self._server
+            self._server = None
+            self._server_thread = None
+            self._callback_url = ""
+        if srv is not None:
+            try:
+                srv.shutdown()
+            except Exception:
+                pass
+            try:
+                srv.server_close()
+            except Exception:
+                pass
+
+    def lookup_sid(self, sid: str) -> _GenaSub | None:
+        if not sid:
+            return None
+        with self._lock:
+            return self._subs.get(sid)
+
+    def _mark_notify(self) -> None:
+        with self._lock:
+            self._last_notify_at = time.monotonic()
+        self._first_notify.set()
+
+    def _subscribe(
+        self, ip: str, path: str, kind: str, target_uuid: str
+    ) -> _GenaSub | None:
+        cb_url = self.callback_url
+        if not cb_url or not is_valid_private_ipv4(ip):
+            return None
+        conn = http.client.HTTPConnection(ip, 1400, timeout=HTTP_TIMEOUT)
+        try:
+            conn.request(
+                "SUBSCRIBE",
+                path,
+                headers={
+                    "Host": f"{ip}:1400",
+                    "CALLBACK": f"<{cb_url}>",
+                    "NT": "upnp:event",
+                    "TIMEOUT": f"Second-{GENA_SUB_TIMEOUT_SEC}",
+                    "Connection": "close",
+                },
+            )
+            resp = conn.getresponse()
+            resp.read(4096)
+            if resp.status != 200:
+                return None
+            sid = (resp.getheader("SID") or "").strip()
+            if not sid:
+                return None
+            ttl = _parse_gena_timeout(resp.getheader("TIMEOUT"))
+            sub = _GenaSub(
+                sid=sid,
+                ip=ip,
+                path=path,
+                kind=kind,
+                target_uuid=target_uuid,
+                expires_at=time.monotonic() + ttl,
+            )
+            with self._lock:
+                self._subs[sid] = sub
+            return sub
+        except Exception:
+            return None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _renew(self, sub: _GenaSub) -> bool:
+        conn = http.client.HTTPConnection(sub.ip, 1400, timeout=HTTP_TIMEOUT)
+        try:
+            conn.request(
+                "SUBSCRIBE",
+                sub.path,
+                headers={
+                    "Host": f"{sub.ip}:1400",
+                    "SID": sub.sid,
+                    "TIMEOUT": f"Second-{GENA_SUB_TIMEOUT_SEC}",
+                    "Connection": "close",
+                },
+            )
+            resp = conn.getresponse()
+            resp.read(4096)
+            if resp.status != 200:
+                return False
+            ttl = _parse_gena_timeout(resp.getheader("TIMEOUT"))
+            with self._lock:
+                if sub.sid in self._subs:
+                    self._subs[sub.sid].expires_at = time.monotonic() + ttl
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _unsubscribe(self, sub: _GenaSub, timeout: float = 1.0) -> None:
+        with self._lock:
+            self._subs.pop(sub.sid, None)
+        conn = http.client.HTTPConnection(sub.ip, 1400, timeout=timeout)
+        try:
+            conn.request(
+                "UNSUBSCRIBE",
+                sub.path,
+                headers={
+                    "Host": f"{sub.ip}:1400",
+                    "SID": sub.sid,
+                    "Connection": "close",
+                },
+            )
+            resp = conn.getresponse()
+            resp.read(1024)
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def probe(self, seed_ip: str, wait_sec: float = GENA_PROBE_WAIT_SEC) -> bool:
+        with self._lock:
+            if self._state != "unprobed":
+                return self._state == "active"
+            self._state = "probing"
+            self._first_notify.clear()
+
+        local_ip = detect_local_ip_for(seed_ip)
+        if not local_ip or not self._start_server(local_ip):
+            with self._lock:
+                self._state = "unavailable"
+            return False
+
+        sub = self._subscribe(seed_ip, "/ZoneGroupTopology/Event", "topology", seed_ip)
+        if sub is None:
+            self._stop_server()
+            with self._lock:
+                self._state = "unavailable"
+            return False
+
+        if self._first_notify.wait(timeout=wait_sec):
+            with self._lock:
+                self._state = "active"
+            return True
+
+        # Initial NOTIFY did not arrive (likely blocked by UFW); tear down cleanly.
+        self._unsubscribe(sub, timeout=0.8)
+        self._stop_server()
+        with self._lock:
+            self._state = "unavailable"
+        return False
+
+    def sync_subscriptions(
+        self,
+        groups: list[ZoneGroup],
+        speakers: list[SpeakerInfo],
+        topo_ip: str,
+        pool: concurrent.futures.ThreadPoolExecutor,
+    ) -> None:
+        if not self.active or not groups:
+            return
+
+        desired: set[tuple[str, str, str, str]] = set()
+        if topo_ip:
+            desired.add(("topology", topo_ip, "/ZoneGroupTopology/Event", topo_ip))
+        for g in groups:
+            desired.add(
+                ("avtransport", g.coord_ip, "/MediaRenderer/AVTransport/Event", g.coord_uuid)
+            )
+            if len(g.member_uuids) > 1:
+                desired.add(
+                    (
+                        "group_rc",
+                        g.coord_ip,
+                        "/MediaRenderer/GroupRenderingControl/Event",
+                        g.coord_uuid,
+                    )
+                )
+        for s in speakers:
+            desired.add(("rc", s.ip, "/MediaRenderer/RenderingControl/Event", s.uuid))
+
+        now = time.monotonic()
+        with self._lock:
+            current_subs = list(self._subs.values())
+
+        existing_by_key: dict[tuple[str, str, str, str], _GenaSub] = {}
+        to_unsub: list[_GenaSub] = []
+        to_renew: list[_GenaSub] = []
+        for sub in current_subs:
+            if sub.key not in desired or sub.key in existing_by_key:
+                to_unsub.append(sub)
+            else:
+                existing_by_key[sub.key] = sub
+                if sub.expires_at - now < 300.0:
+                    to_renew.append(sub)
+
+        to_sub = [k for k in desired if k not in existing_by_key]
+
+        futs: list[concurrent.futures.Future] = []
+        for sub in to_unsub:
+            futs.append(pool.submit(self._unsubscribe, sub))
+        for kind, ip, path, target_uuid in to_sub:
+            futs.append(pool.submit(self._subscribe, ip, path, kind, target_uuid))
+
+        renew_futs = [(sub, pool.submit(self._renew, sub)) for sub in to_renew]
+        for fut in futs:
+            try:
+                fut.result()
+            except Exception:
+                pass
+        for sub, fut in renew_futs:
+            try:
+                ok = fut.result()
+            except Exception:
+                ok = False
+            if not ok:
+                with self._lock:
+                    self._subs.pop(sub.sid, None)
+                self._subscribe(sub.ip, sub.path, sub.kind, sub.target_uuid)
+
+        with self._lock:
+            if not self._subs and self._state == "active":
+                self._state = "unprobed"
+
+    def shutdown(self) -> None:
+        with self._lock:
+            subs = list(self._subs.values())
+            self._subs.clear()
+            self._state = "unavailable"
+        if subs:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(8, len(subs))
+            ) as ex:
+                list(ex.map(lambda s: self._unsubscribe(s, 0.5), subs))
+        self._stop_server()
 
 
 def acquire_instance_lock() -> int | None:
@@ -1751,27 +2619,37 @@ def run_daemon() -> int:
             self.wake_event = threading.Event()
             self.lock = threading.Lock()
             self._topo_lock = threading.Lock()
+            self._event_lock = threading.Lock()
+            self._event_clients: set[socket.socket] = set()
             self.players: dict[str, SonosMprisPlayer] = {}
-            self._seed_ips: list[str] = []
+            cached_ips, cached_rtts = load_cached_seeds()
+            _RTT.seed(cached_rtts)
+            self._seed_ips: list[str] = _RTT.rank(cached_ips)
+            self._last_saved_seeds: tuple[str, ...] = tuple(self._seed_ips)
             self._groups: list[ZoneGroup] = []
             self._speakers: list[SpeakerInfo] = []
             self._group_states: dict[str, TrackState] = {}
             self._speaker_audio: dict[str, tuple[int, bool]] = {}
             self._active_uuids: set[str] = set()
+            self._media_info_hints: set[str] = set()
             self._last_discovery = 0.0
             self._last_topology = 0.0
             self._last_full_sweep = 0.0
+            self._last_settings_refresh = 0.0
             self._last_snapshot_at = 0.0
             self._snapshot_seq = 0
             self._explicit_wake = False
             self._library_cache: list[dict] = []
             self._library_cache_at = 0.0
+            self._queue_cache: dict[str, tuple[int, float, list[dict]]] = {}
             self._pending_mpris_snapshot: dict[str, tuple[ZoneGroup, TrackState]] | None = None
             self._mpris_flush_scheduled = False
             self._rpc_sock: socket.socket | None = None
+            self._gena = _GenaManager(on_event=self._on_gena_event)
+            self._gena_probe_started = False
             # _soap_pool only executes leaf SOAP/HTTP calls so tasks never nest or deadlock.
             self._soap_pool = concurrent.futures.ThreadPoolExecutor(
-                max_workers=16, thread_name_prefix="sonos-soap"
+                max_workers=36, thread_name_prefix="sonos-soap"
             )
             self._rpc_pool = concurrent.futures.ThreadPoolExecutor(
                 max_workers=8, thread_name_prefix="sonos-rpc"
@@ -1812,6 +2690,281 @@ def run_daemon() -> int:
                 self._apply_mpris_on_main(snapshot)
             return False
 
+        def _prune_dead_event_clients_locked(self) -> list[socket.socket]:
+            dead: list[socket.socket] = []
+            for client in list(self._event_clients):
+                try:
+                    peek = client.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+                    if peek == b"":
+                        dead.append(client)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    dead.append(client)
+            for client in dead:
+                self._event_clients.discard(client)
+            return dead
+
+        def _add_event_client(self, conn: socket.socket) -> None:
+            initial_line: bytes | None = None
+            with self.lock:
+                if self._groups and self._group_states:
+                    payload = build_state_payload(
+                        self._groups,
+                        self._speakers,
+                        self._group_states,
+                        self._speaker_audio,
+                        gena_active=self._gena.active,
+                        cached=True,
+                    )
+                    initial_line = (json.dumps(payload) + "\n").encode("utf-8")
+            with self._event_lock:
+                dead = self._prune_dead_event_clients_locked()
+                self._event_clients.add(conn)
+            for stale in dead:
+                try:
+                    stale.close()
+                except OSError:
+                    pass
+            if initial_line is not None:
+                try:
+                    conn.settimeout(0.5)
+                    conn.sendall(initial_line)
+                except OSError:
+                    with self._event_lock:
+                        self._event_clients.discard(conn)
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+
+        def _broadcast_state(self, payload: dict | None = None) -> None:
+            with self._event_lock:
+                if not self._event_clients:
+                    return
+                clients = list(self._event_clients)
+            if payload is None:
+                with self.lock:
+                    if not self._groups or not self._group_states:
+                        return
+                    payload = build_state_payload(
+                        self._groups,
+                        self._speakers,
+                        self._group_states,
+                        self._speaker_audio,
+                        gena_active=self._gena.active,
+                        cached=False,
+                    )
+            line = (json.dumps(payload) + "\n").encode("utf-8")
+            dead: list[socket.socket] = []
+            for conn in clients:
+                try:
+                    conn.settimeout(0.5)
+                    conn.sendall(line)
+                except OSError:
+                    dead.append(conn)
+            if dead:
+                with self._event_lock:
+                    for conn in dead:
+                        self._event_clients.discard(conn)
+                for conn in dead:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+
+        def _maybe_start_gena(self, seed_ip: str) -> None:
+            if not seed_ip or self.stop_event.is_set():
+                return
+            with self.lock:
+                if self._gena_probe_started:
+                    return
+                self._gena_probe_started = True
+
+            def _probe_worker() -> None:
+                if self.stop_event.is_set():
+                    return
+                if self._gena.probe(seed_ip):
+                    with self.lock:
+                        groups = list(self._groups)
+                        speakers = list(self._speakers)
+                        topo_ip = self._seed_ips[0] if self._seed_ips else seed_ip
+                    self._gena.sync_subscriptions(
+                        groups, speakers, topo_ip, self._soap_pool
+                    )
+                    self._broadcast_state()
+
+            try:
+                self._action_pool.submit(_probe_worker)
+            except RuntimeError:
+                pass
+
+        def _sync_position_for_group(self, group: ZoneGroup) -> None:
+            pos_xml = _soap_safe(
+                group.coord_ip,
+                "/MediaRenderer/AVTransport/Control",
+                "AVTransport",
+                "GetPositionInfo",
+                "<InstanceID>0</InstanceID>",
+            )
+            if not pos_xml:
+                return
+            _, _, _, _, _, duration_sec, position_sec, track_num = _parse_position_info(
+                group.coord_ip, pos_xml
+            )
+            mpris_snapshot: dict[str, tuple[ZoneGroup, TrackState]] = {}
+            with self.lock:
+                st = self._group_states.get(group.coord_uuid)
+                if st is None:
+                    return
+                self._group_states[group.coord_uuid] = replace(
+                    st,
+                    position_sec=position_sec,
+                    duration_sec=duration_sec or st.duration_sec,
+                    track_num=track_num or st.track_num,
+                )
+                self._snapshot_seq += 1
+                self._last_snapshot_at = time.monotonic()
+                for g in self._groups:
+                    gst = self._group_states.get(g.coord_uuid)
+                    if gst and (gst.playback_status == "Playing" or gst.has_track):
+                        mpris_snapshot[g.coord_uuid] = (g, gst)
+            self._schedule_mpris_update(mpris_snapshot)
+            self._broadcast_state()
+
+        def _on_gena_event(self, sub: _GenaSub, body: str) -> None:
+            if self.stop_event.is_set():
+                return
+            if sub.kind == "topology":
+                parsed = parse_gena_topology_event(body)
+                if not parsed:
+                    return
+                groups, speakers = parsed
+                all_ips = [s.ip for s in speakers] + [g.coord_ip for g in groups]
+                unique_ips = list(dict.fromkeys(all_ips))
+                ranked = _RTT.rank(unique_ips)
+                with self.lock:
+                    self._groups = groups
+                    self._speakers = speakers
+                    self._seed_ips = ranked
+                    self._last_topology = time.monotonic()
+                    self._queue_cache.clear()
+                    valid = {g.coord_uuid for g in groups}
+                    self._group_states = {
+                        k: v for k, v in self._group_states.items() if k in valid
+                    }
+                    self._snapshot_seq += 1
+                    topo_ip = ranked[0] if ranked else sub.ip
+                if self._gena.active:
+                    try:
+                        self._action_pool.submit(
+                            self._gena.sync_subscriptions,
+                            groups,
+                            speakers,
+                            topo_ip,
+                            self._soap_pool,
+                        )
+                    except RuntimeError:
+                        pass
+                self._broadcast_state()
+                return
+
+            mpris_snapshot: dict[str, tuple[ZoneGroup, TrackState]] = {}
+            sync_group: ZoneGroup | None = None
+            changed = False
+
+            if sub.kind == "avtransport":
+                with self.lock:
+                    prev = self._group_states.get(sub.target_uuid)
+                    group = find_group(self._groups, sub.target_uuid)
+                    sp_audio = self._speaker_audio.get(sub.target_uuid)
+                updated, need_pos_sync, queue_changed = parse_gena_avtransport_event(
+                    sub.ip, body, prev
+                )
+                if updated is not None:
+                    if (
+                        prev is None
+                        and group is not None
+                        and len(group.member_uuids) == 1
+                        and sp_audio is not None
+                    ):
+                        updated = replace(
+                            updated,
+                            group_volume=sp_audio[0],
+                            group_muted=sp_audio[1],
+                        )
+                    with self.lock:
+                        self._group_states[sub.target_uuid] = updated
+                        if queue_changed:
+                            self._queue_cache.pop(sub.target_uuid, None)
+                        if updated.playback_status == "Playing" or updated.has_track:
+                            self._active_uuids.add(sub.target_uuid)
+                        else:
+                            self._active_uuids.discard(sub.target_uuid)
+                        self._snapshot_seq += 1
+                        self._last_snapshot_at = time.monotonic()
+                        for g in self._groups:
+                            gst = self._group_states.get(g.coord_uuid)
+                            if gst and (gst.playback_status == "Playing" or gst.has_track):
+                                mpris_snapshot[g.coord_uuid] = (g, gst)
+                    changed = True
+                    if need_pos_sync and group is not None:
+                        sync_group = group
+
+            elif sub.kind == "group_rc":
+                vol, muted = parse_gena_group_rc_event(body)
+                if vol is not None or muted is not None:
+                    with self.lock:
+                        prev = self._group_states.get(sub.target_uuid)
+                        if prev is not None:
+                            self._group_states[sub.target_uuid] = replace(
+                                prev,
+                                group_volume=vol if vol is not None else prev.group_volume,
+                                group_muted=muted if muted is not None else prev.group_muted,
+                            )
+                            self._snapshot_seq += 1
+                            self._last_snapshot_at = time.monotonic()
+                            for g in self._groups:
+                                gst = self._group_states.get(g.coord_uuid)
+                                if gst and (gst.playback_status == "Playing" or gst.has_track):
+                                    mpris_snapshot[g.coord_uuid] = (g, gst)
+                            changed = True
+
+            elif sub.kind == "rc":
+                vol, muted = parse_gena_rc_event(body)
+                if vol is not None or muted is not None:
+                    with self.lock:
+                        old_vol, old_muted = self._speaker_audio.get(
+                            sub.target_uuid, (0, False)
+                        )
+                        new_vol = vol if vol is not None else old_vol
+                        new_muted = muted if muted is not None else old_muted
+                        self._speaker_audio[sub.target_uuid] = (new_vol, new_muted)
+                        # Single-room coordinators reflect RenderingControl directly on group volume/mute.
+                        g = find_group(self._groups, sub.target_uuid)
+                        if g is not None and len(g.member_uuids) == 1:
+                            prev = self._group_states.get(g.coord_uuid)
+                            if prev is not None:
+                                self._group_states[g.coord_uuid] = replace(
+                                    prev, group_volume=new_vol, group_muted=new_muted
+                                )
+                        self._snapshot_seq += 1
+                        self._last_snapshot_at = time.monotonic()
+                        for grp in self._groups:
+                            gst = self._group_states.get(grp.coord_uuid)
+                            if gst and (gst.playback_status == "Playing" or gst.has_track):
+                                mpris_snapshot[grp.coord_uuid] = (grp, gst)
+                        changed = True
+
+            if changed:
+                self._schedule_mpris_update(mpris_snapshot)
+                self._broadcast_state()
+            if sync_group is not None:
+                try:
+                    self._soap_pool.submit(self._sync_position_for_group, sync_group)
+                except RuntimeError:
+                    pass
+
         def _ensure_topology(
             self, force: bool = False, interval: float = TOPOLOGY_ACTIVE_INTERVAL
         ) -> tuple[list[ZoneGroup], list[SpeakerInfo]]:
@@ -1823,16 +2976,20 @@ def run_daemon() -> int:
                     last_discovery = self._last_discovery
                     last_topology = self._last_topology
 
-                need_discovery = (
-                    not seed_ips
-                    or (now - last_discovery) >= DISCOVERY_INTERVAL
-                    or (force and (now - last_discovery) >= FORCE_DISCOVERY_MIN_INTERVAL)
-                )
-                if need_discovery:
+                # Only run mDNS/SSDP discovery when we have no known seeds (or explicit
+                # forced recovery with empty groups); GetZoneGroupState already discovers
+                # every speaker in the house once any single seed IP answers.
+                discovered_now = False
+                if not seed_ips and (
+                    force
+                    or last_discovery == 0.0
+                    or (now - last_discovery) >= FORCE_DISCOVERY_MIN_INTERVAL
+                ):
                     found = discover_sonos_ips()
-                    if found:
-                        seed_ips = found
+                    discovered_now = True
                     last_discovery = time.monotonic()
+                    if found:
+                        seed_ips = _RTT.rank(found)
                     with self.lock:
                         self._seed_ips = list(seed_ips)
                         self._last_discovery = last_discovery
@@ -1840,26 +2997,39 @@ def run_daemon() -> int:
                 if seed_ips and (
                     force or not has_groups or (now - last_topology) >= interval
                 ):
-                    groups, speakers = fetch_topology(seed_ips)
-                    if not groups and force and not need_discovery:
+                    ranked_seeds = _RTT.rank(seed_ips)
+                    groups, speakers = fetch_topology(ranked_seeds)
+                    if not groups and not discovered_now:
                         found = discover_sonos_ips()
                         last_discovery = time.monotonic()
                         with self.lock:
                             self._last_discovery = last_discovery
                         if found:
-                            seed_ips = found
-                            groups, speakers = fetch_topology(seed_ips)
+                            ranked_seeds = _RTT.rank(found)
+                            groups, speakers = fetch_topology(ranked_seeds)
 
                     if groups:
-                        coord_ips = {g.coord_ip for g in groups}
-                        new_seeds = [g.coord_ip for g in groups] + [
-                            ip for ip in seed_ips if ip not in coord_ips
-                        ]
+                        all_ips = list(
+                            dict.fromkeys(
+                                [s.ip for s in speakers]
+                                + [g.coord_ip for g in groups]
+                                + ranked_seeds
+                            )
+                        )
+                        new_seeds = _RTT.rank(all_ips)
+                        save_now = False
                         with self.lock:
                             self._groups = groups
                             self._speakers = speakers
                             self._seed_ips = new_seeds
                             self._last_topology = time.monotonic()
+                            seed_tuple = tuple(new_seeds)
+                            if seed_tuple != self._last_saved_seeds:
+                                self._last_saved_seeds = seed_tuple
+                                save_now = True
+                        if save_now:
+                            save_cached_seeds(new_seeds, _RTT.snapshot())
+                        self._maybe_start_gena(new_seeds[0])
                     else:
                         with self.lock:
                             self._groups = []
@@ -1869,16 +3039,94 @@ def run_daemon() -> int:
                 with self.lock:
                     return list(self._groups), list(self._speakers)
 
-        def _fetch_full_snapshot(self, force_topology: bool = False) -> dict:
+        def _fetch_group_snapshot(
+            self, group: ZoneGroup, include_speakers: bool = True
+        ) -> dict:
+            with self.lock:
+                groups = list(self._groups)
+                speakers = list(self._speakers)
+                prev_states = dict(self._group_states)
+                hints = set(self._media_info_hints)
+
+            member_speakers = (
+                [s for s in speakers if s.coord_uuid == group.coord_uuid]
+                if include_speakers
+                else []
+            )
+            polled_states, polled_audio, failed_any = fetch_groups_batch(
+                [group],
+                member_speakers,
+                self._soap_pool,
+                include_speakers=include_speakers,
+                known_active_uuids=None,
+                prev_states=prev_states,
+                media_info_hints=hints,
+                selected_coord_uuid=group.coord_uuid,
+                refresh_all_settings=True,
+            )
+
+            mpris_snapshot: dict[str, tuple[ZoneGroup, TrackState]] = {}
+            with self.lock:
+                if failed_any:
+                    self._last_topology = 0.0
+                self._group_states.update(polled_states)
+                if include_speakers:
+                    self._speaker_audio.update(polled_audio)
+                self._media_info_hints = hints
+                for g in self._groups:
+                    st = self._group_states.get(g.coord_uuid)
+                    if st and (st.playback_status == "Playing" or st.has_track):
+                        mpris_snapshot[g.coord_uuid] = (g, st)
+                self._active_uuids = set(mpris_snapshot.keys())
+                self._last_snapshot_at = time.monotonic()
+                self._snapshot_seq += 1
+                payload = build_state_payload(
+                    self._groups,
+                    self._speakers,
+                    self._group_states,
+                    self._speaker_audio,
+                    gena_active=self._gena.active,
+                    cached=False,
+                )
+
+            self._schedule_mpris_update(mpris_snapshot)
+            self._broadcast_state(payload)
+            return payload
+
+        def _fetch_full_snapshot(
+            self,
+            force_topology: bool = False,
+            include_speakers: bool = True,
+            selected_coord_uuid: str = "",
+        ) -> dict:
             groups, speakers = self._ensure_topology(
                 force=force_topology, interval=10.0
             )
+            now = time.monotonic()
+            with self.lock:
+                prev_states = dict(self._group_states)
+                prev_audio = dict(self._speaker_audio)
+                hints = set(self._media_info_hints)
+                refresh_settings = (
+                    force_topology
+                    or not prev_states
+                    or (now - self._last_settings_refresh) >= SETTINGS_REFRESH_INTERVAL
+                )
+                if refresh_settings:
+                    self._last_settings_refresh = now
+                # Always ensure speaker audio is populated on the first snapshot.
+                need_speakers = include_speakers or not prev_audio
+
             group_states, speaker_audio, failed_any = fetch_groups_batch(
                 groups,
                 speakers,
                 self._soap_pool,
-                include_speakers=True,
+                include_speakers=need_speakers,
                 known_active_uuids=None,
+                prev_states=prev_states,
+                media_info_hints=hints,
+                selected_coord_uuid=selected_coord_uuid,
+                refresh_all_settings=refresh_settings,
             )
 
             mpris_snapshot: dict[str, tuple[ZoneGroup, TrackState]] = {}
@@ -1891,13 +3139,39 @@ def run_daemon() -> int:
                 if failed_any:
                     self._last_topology = 0.0
                 self._group_states = group_states
-                self._speaker_audio = speaker_audio
+                if need_speakers:
+                    self._speaker_audio = speaker_audio
+                else:
+                    # Keep cached per-member audio, updating single-room coordinators from group_states.
+                    single_coords = {
+                        g.coord_uuid for g in groups if len(g.member_uuids) == 1
+                    }
+                    merged_audio = dict(self._speaker_audio)
+                    for s in speakers:
+                        if (
+                            s.is_coordinator
+                            and s.coord_uuid in single_coords
+                            and s.coord_uuid in group_states
+                        ):
+                            st = group_states[s.coord_uuid]
+                            merged_audio[s.uuid] = (st.group_volume, st.group_muted)
+                    self._speaker_audio = merged_audio
+                self._media_info_hints = hints
                 self._active_uuids = set(mpris_snapshot.keys())
                 self._last_snapshot_at = time.monotonic()
                 self._snapshot_seq += 1
+                payload = build_state_payload(
+                    groups,
+                    speakers,
+                    self._group_states,
+                    self._speaker_audio,
+                    gena_active=self._gena.active,
+                    cached=False,
+                )
 
             self._schedule_mpris_update(mpris_snapshot)
-            return build_state_payload(groups, speakers, group_states, speaker_audio)
+            self._broadcast_state(payload)
+            return payload
 
         def _apply_mpris_on_main(
             self, snapshot: dict[str, tuple[ZoneGroup, TrackState]]
@@ -1938,13 +3212,40 @@ def run_daemon() -> int:
             coord_uuid = str(req.get("coord_uuid") or "").strip()
 
             if cmd == "get_state":
+                force_topo = bool(req.get("force_topology", False))
+                want_cached = bool(req.get("cached", False))
+                include_speakers = bool(req.get("include_speakers", True))
+                selected_coord = str(
+                    req.get("selected_coord_uuid") or coord_uuid
+                ).strip()
+                if want_cached and not force_topo:
+                    with self.lock:
+                        if self._groups and self._group_states:
+                            return build_state_payload(
+                                self._groups,
+                                self._speakers,
+                                self._group_states,
+                                self._speaker_audio,
+                                gena_active=self._gena.active,
+                                cached=True,
+                            )
+                if coord_uuid and not force_topo:
+                    target_group = self._find_group(coord_uuid)
+                    if target_group is not None:
+                        return self._fetch_group_snapshot(
+                            target_group, include_speakers=include_speakers
+                        )
                 return self._fetch_full_snapshot(
-                    force_topology=bool(req.get("force_topology", False))
+                    force_topology=force_topo,
+                    include_speakers=include_speakers,
+                    selected_coord_uuid=selected_coord,
                 )
 
             group = self._find_group(coord_uuid)
 
             if cmd == "refresh":
+                with self.lock:
+                    self._queue_cache.clear()
                 self.trigger_poll(force_topology=True, full_sweep=True)
                 return self._fetch_full_snapshot(force_topology=True)
 
@@ -1958,11 +3259,16 @@ def run_daemon() -> int:
                         and (now - self._library_cache_at) < LIBRARY_CACHE_TTL
                     ):
                         return {"ok": True, "items": list(self._library_cache)}
-                    seed_ip = self._seed_ips[0] if self._seed_ips else ""
-                ip = group.coord_ip if group else seed_ip
+                    ranked_seeds = _RTT.rank(list(self._seed_ips))
+                # Favorites & Playlists are household-wide; query the fastest speaker on the LAN.
+                ip = ranked_seeds[0] if ranked_seeds else (group.coord_ip if group else "")
                 if not ip:
                     groups, _ = self._ensure_topology(force=False)
-                    ip = groups[0].coord_ip if groups else ""
+                    ip = (
+                        _RTT.rank([g.coord_ip for g in groups])[0]
+                        if groups
+                        else ""
+                    )
                 if not ip:
                     return {"ok": False, "error": "no Sonos speakers discovered"}
                 fav_fut = self._soap_pool.submit(
@@ -1981,9 +3287,30 @@ def run_daemon() -> int:
                 if not group:
                     return {"ok": False, "error": "no Sonos group"}
                 limit = max(1, min(300, int(req.get("limit", 150))))
+                force = bool(req.get("force", False))
+                now = time.monotonic()
+                if not force:
+                    with self.lock:
+                        cached_q = self._queue_cache.get(group.coord_uuid)
+                        if (
+                            cached_q is not None
+                            and cached_q[0] >= limit
+                            and (now - cached_q[1]) < QUEUE_CACHE_TTL
+                        ):
+                            return {
+                                "ok": True,
+                                "items": list(cached_q[2][:limit]),
+                                "coord_uuid": group.coord_uuid,
+                            }
                 items = browse_content_directory(
                     group.coord_ip, "Q:0", limit=limit, minimal=True
                 )
+                with self.lock:
+                    self._queue_cache[group.coord_uuid] = (
+                        limit,
+                        time.monotonic(),
+                        items,
+                    )
                 return {"ok": True, "items": items, "coord_uuid": group.coord_uuid}
 
             if cmd in ("play", "pause", "play_pause", "next", "previous", "stop"):
@@ -2045,7 +3372,8 @@ def run_daemon() -> int:
                             self._group_states[group.coord_uuid] = replace(
                                 st, playback_status=new_status
                             )
-                self.trigger_poll()
+                if not self._gena.active:
+                    self.trigger_poll()
                 return {"ok": True}
 
             if cmd == "seek":
@@ -2059,7 +3387,14 @@ def run_daemon() -> int:
                     "Seek",
                     f"<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>{format_sec_to_hms(sec)}</Target>",
                 )
-                self.trigger_poll()
+                with self.lock:
+                    st = self._group_states.get(group.coord_uuid)
+                    if st is not None:
+                        self._group_states[group.coord_uuid] = replace(
+                            st, position_sec=sec
+                        )
+                if not self._gena.active:
+                    self.trigger_poll()
                 return {"ok": True}
 
             if cmd == "set_play_mode":
@@ -2075,7 +3410,8 @@ def run_daemon() -> int:
                     "SetPlayMode",
                     f"<InstanceID>0</InstanceID><NewPlayMode>{mode}</NewPlayMode>",
                 )
-                self.trigger_poll()
+                if not self._gena.active:
+                    self.trigger_poll()
                 return {"ok": True, "mode": mode}
 
             if cmd == "set_group_volume":
@@ -2098,7 +3434,8 @@ def run_daemon() -> int:
                         "SetVolume",
                         f"<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>{vol}</DesiredVolume>",
                     )
-                self.trigger_poll()
+                if not self._gena.active:
+                    self.trigger_poll()
                 return {"ok": True}
 
             if cmd == "set_group_mute":
@@ -2121,7 +3458,8 @@ def run_daemon() -> int:
                         "SetMute",
                         f"<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredMute>{muted}</DesiredMute>",
                     )
-                self.trigger_poll()
+                if not self._gena.active:
+                    self.trigger_poll()
                 return {"ok": True}
 
             if cmd == "set_speaker_volume":
@@ -2136,7 +3474,8 @@ def run_daemon() -> int:
                     "SetVolume",
                     f"<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>{vol}</DesiredVolume>",
                 )
-                self.trigger_poll()
+                if not self._gena.active:
+                    self.trigger_poll()
                 return {"ok": True}
 
             if cmd == "set_speaker_mute":
@@ -2151,7 +3490,8 @@ def run_daemon() -> int:
                     "SetMute",
                     f"<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredMute>{muted}</DesiredMute>",
                 )
-                self.trigger_poll()
+                if not self._gena.active:
+                    self.trigger_poll()
                 return {"ok": True}
 
             if cmd == "join_group":
@@ -2169,6 +3509,8 @@ def run_daemon() -> int:
                         f"<CurrentURI>{xml_escape(f'x-rincon:{target.coord_uuid}')}</CurrentURI>"
                         "<CurrentURIMetaData></CurrentURIMetaData>",
                     )
+                with self.lock:
+                    self._queue_cache.clear()
                 self.trigger_poll(force_topology=True, full_sweep=True)
                 return {"ok": True}
 
@@ -2183,6 +3525,8 @@ def run_daemon() -> int:
                     "BecomeCoordinatorOfStandaloneGroup",
                     "<InstanceID>0</InstanceID>",
                 )
+                with self.lock:
+                    self._queue_cache.clear()
                 self.trigger_poll(force_topology=True, full_sweep=True)
                 return {"ok": True}
 
@@ -2195,7 +3539,10 @@ def run_daemon() -> int:
                 if not uri:
                     return {"ok": False, "error": "missing uri"}
                 play_uri_on_coordinator(group, uri, metadata, as_next=as_next)
-                self.trigger_poll()
+                with self.lock:
+                    self._queue_cache.pop(group.coord_uuid, None)
+                if not self._gena.active:
+                    self.trigger_poll()
                 return {"ok": True}
 
             if cmd == "play_queue_track":
@@ -2225,7 +3572,8 @@ def run_daemon() -> int:
                     "Play",
                     "<InstanceID>0</InstanceID><Speed>1</Speed>",
                 )
-                self.trigger_poll()
+                if not self._gena.active:
+                    self.trigger_poll()
                 return {"ok": True}
 
             return {"ok": False, "error": f"unknown command: {cmd}"}
@@ -2270,6 +3618,7 @@ def run_daemon() -> int:
                     pass
 
         def _serve_client(self, conn: socket.socket) -> None:
+            keep_open = False
             try:
                 conn.settimeout(4.0)
                 data = b""
@@ -2279,6 +3628,10 @@ def run_daemon() -> int:
                         break
                     data += chunk
                 req = json.loads(data.decode("utf-8", "replace").strip() or "{}")
+                if str(req.get("cmd") or "").strip() == "subscribe":
+                    keep_open = True
+                    self._add_event_client(conn)
+                    return
                 try:
                     resp = self._handle_rpc(req)
                 except Exception as exc:
@@ -2287,10 +3640,11 @@ def run_daemon() -> int:
             except Exception:
                 pass
             finally:
-                try:
-                    conn.close()
-                except OSError:
-                    pass
+                if not keep_open:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
 
         def _poll_loop(self) -> None:
             while not self.stop_event.is_set():
@@ -2300,6 +3654,22 @@ def run_daemon() -> int:
                     last_snapshot_at = self._last_snapshot_at
                     explicit_wake = self._explicit_wake
                     self._explicit_wake = False
+
+                # When UPnP GENA push is active, renew/sync subscriptions on a quiet
+                # heartbeat instead of polling speakers every 2 seconds.
+                if self._gena.active and not explicit_wake:
+                    with self.lock:
+                        groups = list(self._groups)
+                        speakers = list(self._speakers)
+                        topo_ip = self._seed_ips[0] if self._seed_ips else ""
+                    if groups:
+                        self._gena.sync_subscriptions(
+                            groups, speakers, topo_ip, self._soap_pool
+                        )
+                        if self._gena.active:
+                            self.wake_event.wait(timeout=GENA_HEARTBEAT_INTERVAL)
+                            self.wake_event.clear()
+                            continue
 
                 # If the open panel just fetched a full snapshot, avoid duplicating LAN polls.
                 recent_interval = compute_poll_interval(had_active, True)
@@ -2317,7 +3687,7 @@ def run_daemon() -> int:
                 topo_interval = (
                     TOPOLOGY_ACTIVE_INTERVAL if had_active else TOPOLOGY_IDLE_INTERVAL
                 )
-                groups, _ = self._ensure_topology(force=False, interval=topo_interval)
+                groups, speakers = self._ensure_topology(force=False, interval=topo_interval)
 
                 if not groups:
                     self._schedule_mpris_update({})
@@ -2332,6 +3702,8 @@ def run_daemon() -> int:
                     if full_sweep:
                         self._last_full_sweep = now
                     active_uuids = set(self._active_uuids)
+                    prev_states = dict(self._group_states)
+                    hints = set(self._media_info_hints)
                     seq_before = self._snapshot_seq
 
                 targets = (
@@ -2348,6 +3720,8 @@ def run_daemon() -> int:
                     self._soap_pool,
                     include_speakers=False,
                     known_active_uuids=active_uuids,
+                    prev_states=prev_states,
+                    media_info_hints=hints,
                 )
 
                 mpris_snapshot: dict[str, tuple[ZoneGroup, TrackState]] = {}
@@ -2358,6 +3732,7 @@ def run_daemon() -> int:
                 with self.lock:
                     if failed_any:
                         self._last_topology = 0.0
+                    self._media_info_hints = hints
                     # If _fetch_full_snapshot ran while we were polling, keep its fresher data.
                     if self._snapshot_seq == seq_before:
                         merged = {
@@ -2387,8 +3762,17 @@ def run_daemon() -> int:
 
                 if should_publish:
                     self._schedule_mpris_update(mpris_snapshot)
+                    self._broadcast_state()
 
-                interval = compute_poll_interval(any_playing, bool(groups))
+                if self._gena.active:
+                    with self.lock:
+                        topo_ip = self._seed_ips[0] if self._seed_ips else ""
+                    self._gena.sync_subscriptions(
+                        groups, speakers, topo_ip, self._soap_pool
+                    )
+                    interval = GENA_HEARTBEAT_INTERVAL
+                else:
+                    interval = compute_poll_interval(any_playing, bool(groups))
                 self.wake_event.wait(timeout=interval)
                 self.wake_event.clear()
 
@@ -2399,6 +3783,15 @@ def run_daemon() -> int:
         def shutdown(self) -> None:
             self.stop_event.set()
             self.wake_event.set()
+            self._gena.shutdown()
+            with self._event_lock:
+                clients = list(self._event_clients)
+                self._event_clients.clear()
+            for conn in clients:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
             if self._rpc_sock is not None:
                 try:
                     self._rpc_sock.close()

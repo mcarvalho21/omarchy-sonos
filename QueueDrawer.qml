@@ -63,7 +63,7 @@ Item {
         accent: root.controller.accent
         horizontalPadding: Style.space(7)
         verticalPadding: Style.space(5)
-        onClicked: root.controller.fetchQueue()
+        onClicked: root.controller.fetchQueue(true)
       }
     }
 

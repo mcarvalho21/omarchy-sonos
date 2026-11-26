@@ -3,7 +3,7 @@ import Quickshell
 import Quickshell.Io
 
 // Direct Unix-socket JSON-line RPC client for sonos-mpris.py ($XDG_RUNTIME_DIR/mc-sonos.sock).
-// Avoids spawning python3 subprocesses on every poll tick, click, or volume step.
+// Supports one-shot RPC commands plus a persistent event-push stream while the panel is open.
 Item {
   id: root
   visible: false
@@ -12,6 +12,10 @@ Item {
     var runtime = Quickshell.env("XDG_RUNTIME_DIR") || ""
     return runtime !== "" ? runtime + "/mc-sonos.sock" : ""
   }
+
+  // Subscribe to daemon state pushes (cached initial paint + live GENA/poll updates)
+  // only while the panel is open (zero idle sockets when closed).
+  property bool subscribed: false
 
   property bool stateLoading: false
   property bool libraryLoading: false
@@ -22,12 +26,13 @@ Item {
   signal stateReceived(string rawJson)
   signal libraryReceived(string rawJson)
   signal queueReceived(string rawJson)
-  signal commandCompleted()
+  signal commandCompleted(string cmd, string coordUuid)
 
   property var _cmdQueue: []
   property var _pendingVolumes: ({})
   property var _pendingStateFetch: null
   property var _pendingQueueFetch: null
+  property var _activeCmd: null
 
   function _volumeKey(payload) {
     if (!payload) return ""
@@ -41,18 +46,53 @@ Item {
     return false
   }
 
-  function fetchState(forceTopology, showSpinner) {
+  function fetchState(forceTopology, showSpinner, opts) {
     if (!socketPath) return
+    opts = opts || ({})
+    var reqForce = !!forceTopology
+    var reqSpinner = !!showSpinner
+    var reqCoord = opts.coordUuid ? String(opts.coordUuid) : ""
+    var reqIncludeSpeakers = opts.includeSpeakers !== undefined ? !!opts.includeSpeakers : true
+    var reqSelectedCoord = opts.selectedCoordUuid ? String(opts.selectedCoordUuid) : ""
+    var reqCached = !!opts.cached
+
     if (stateChan.busy) {
       var prev = _pendingStateFetch
-      _pendingStateFetch = {
-        forceTopology: (prev ? prev.forceTopology : false) || !!forceTopology,
-        showSpinner: (prev ? prev.showSpinner : false) || !!showSpinner
+      if (!prev) {
+        _pendingStateFetch = {
+          forceTopology: reqForce,
+          showSpinner: reqSpinner,
+          coordUuid: reqCoord,
+          includeSpeakers: reqIncludeSpeakers,
+          selectedCoordUuid: reqSelectedCoord,
+          cached: reqCached
+        }
+      } else {
+        // If either queued fetch needs a full snapshot, upgrade targeted to full.
+        var mergedCoord = (prev.coordUuid !== "" && reqCoord !== "" && prev.coordUuid === reqCoord)
+          ? reqCoord
+          : ""
+        _pendingStateFetch = {
+          forceTopology: prev.forceTopology || reqForce,
+          showSpinner: prev.showSpinner || reqSpinner,
+          coordUuid: mergedCoord,
+          includeSpeakers: prev.includeSpeakers || reqIncludeSpeakers,
+          selectedCoordUuid: reqSelectedCoord || prev.selectedCoordUuid,
+          cached: prev.cached && reqCached
+        }
       }
       return
     }
-    if (showSpinner) stateLoading = true
-    if (!stateChan.send({ cmd: "get_state", force_topology: !!forceTopology })) {
+    if (reqSpinner) stateLoading = true
+    var payload = {
+      cmd: "get_state",
+      force_topology: reqForce,
+      include_speakers: reqIncludeSpeakers
+    }
+    if (reqCoord !== "") payload.coord_uuid = reqCoord
+    if (reqSelectedCoord !== "") payload.selected_coord_uuid = reqSelectedCoord
+    if (reqCached) payload.cached = true
+    if (!stateChan.send(payload)) {
       stateLoading = false
     }
   }
@@ -61,7 +101,7 @@ Item {
     if (!_pendingStateFetch || stateChan.busy) return
     var next = _pendingStateFetch
     _pendingStateFetch = null
-    fetchState(next.forceTopology, next.showSpinner)
+    fetchState(next.forceTopology, next.showSpinner, next)
   }
 
   function fetchLibrary(force) {
@@ -72,14 +112,17 @@ Item {
     }
   }
 
-  function fetchQueue(coordUuid, limit) {
+  function fetchQueue(coordUuid, limit, force) {
     if (!socketPath || !coordUuid) return
     if (queueChan.busy) {
-      _pendingQueueFetch = { coordUuid: coordUuid, limit: limit }
+      var prevForce = _pendingQueueFetch && _pendingQueueFetch.coordUuid === coordUuid
+        ? _pendingQueueFetch.force
+        : false
+      _pendingQueueFetch = { coordUuid: coordUuid, limit: limit, force: prevForce || !!force }
       return
     }
     queueLoading = true
-    if (!queueChan.send({ cmd: "browse_queue", coord_uuid: coordUuid, limit: limit })) {
+    if (!queueChan.send({ cmd: "browse_queue", coord_uuid: coordUuid, limit: limit, force: !!force })) {
       queueLoading = false
     }
   }
@@ -88,7 +131,7 @@ Item {
     if (!_pendingQueueFetch || queueChan.busy) return
     var next = _pendingQueueFetch
     _pendingQueueFetch = null
-    fetchQueue(next.coordUuid, next.limit)
+    fetchQueue(next.coordUuid, next.limit, next.force)
   }
 
   function sendCommand(payload) {
@@ -136,7 +179,10 @@ Item {
   function drainCommands() {
     if (cmdChan.busy || _cmdQueue.length === 0) return
     var next = _cmdQueue.shift()
-    cmdChan.send(next)
+    _activeCmd = next
+    if (!cmdChan.send(next)) {
+      _activeCmd = null
+    }
   }
 
   Timer {
@@ -144,6 +190,55 @@ Item {
     interval: 75
     repeat: false
     onTriggered: root.flushPendingVolume()
+  }
+
+  // Persistent push stream for instant cached initial paint and live daemon updates.
+  Timer {
+    id: eventReconnect
+    interval: 2000
+    repeat: false
+    onTriggered: {
+      if (root.subscribed && root.socketPath !== "" && !eventSock.connected)
+        eventSock.connected = true
+    }
+  }
+
+  onSubscribedChanged: {
+    if (subscribed && socketPath !== "") {
+      eventReconnect.stop()
+      if (!eventSock.connected) eventSock.connected = true
+    } else {
+      eventReconnect.stop()
+      if (eventSock.connected) eventSock.connected = false
+    }
+  }
+
+  Socket {
+    id: eventSock
+    path: root.socketPath
+    connected: false
+
+    parser: SplitParser {
+      splitMarker: "\n"
+      onRead: function(line) {
+        if (!root.subscribed) return
+        var text = String(line || "").trim()
+        if (text !== "") root.stateReceived(text)
+      }
+    }
+
+    onConnectionStateChanged: {
+      if (connected && root.subscribed) {
+        write('{"cmd":"subscribe"}\n')
+        flush()
+      } else if (!connected && root.subscribed) {
+        eventReconnect.restart()
+      }
+    }
+
+    onError: function() {
+      if (root.subscribed) eventReconnect.restart()
+    }
   }
 
   component RpcChannel: Item {
@@ -271,9 +366,17 @@ Item {
     socketPath: root.socketPath
     timeoutMs: 5000
     onRawResponse: function() {
-      root.commandCompleted()
+      var done = root._activeCmd
+      root._activeCmd = null
+      root.commandCompleted(
+        done && done.cmd ? String(done.cmd) : "",
+        done && done.coord_uuid ? String(done.coord_uuid) : ""
+      )
       Qt.callLater(root.drainCommands)
     }
-    onFailed: Qt.callLater(root.drainCommands)
+    onFailed: {
+      root._activeCmd = null
+      Qt.callLater(root.drainCommands)
+    }
   }
 }
