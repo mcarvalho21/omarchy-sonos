@@ -71,16 +71,30 @@ Item {
         spacing: Style.space(4)
 
         Repeater {
-          model: root.visible ? root.controller.groups : []
+          model: root.visible ? root.controller.groupUuids : []
 
           CursorSurface {
             id: groupRow
             required property var modelData
             required property int index
 
+            readonly property var group: root.controller.groupByUuid(modelData) || ({
+              coord_uuid: modelData,
+              coord_name: "",
+              room_label: "",
+              member_names: [],
+              member_uuids: [],
+              playback_status: "Stopped",
+              title: "",
+              artist: "",
+              source_name: "",
+              source_icon: "",
+              group_volume: 0,
+              group_muted: false
+            })
             readonly property bool selected: root.controller.activeGroup !== null
-              && root.controller.activeGroup.coord_uuid === modelData.coord_uuid
-            readonly property bool playing: modelData.playback_status === "Playing"
+              && root.controller.activeGroup.coord_uuid === group.coord_uuid
+            readonly property bool playing: group.playback_status === "Playing"
 
             width: parent.width
             implicitHeight: gInner.implicitHeight + Style.space(10)
@@ -106,8 +120,8 @@ Item {
                 Layout.alignment: Qt.AlignVCenter
                 Layout.preferredWidth: Style.space(16)
                 textFormat: Text.PlainText
-                text: groupRow.playing ? (groupRow.modelData.source_icon || "󰐊")
-                  : (groupRow.modelData.playback_status === "Paused" ? "󰏤" : "󰓄")
+                text: groupRow.playing ? (groupRow.group.source_icon || "󰐊")
+                  : (groupRow.group.playback_status === "Paused" ? "󰏤" : "󰓄")
                 color: groupRow.playing ? root.controller.accent : root.controller.dim
                 font.family: root.controller.fontFamily
                 font.pixelSize: Style.font.body
@@ -123,9 +137,9 @@ Item {
                 Text {
                   width: parent.width
                   textFormat: Text.PlainText
-                  text: (Array.isArray(groupRow.modelData.member_names) && groupRow.modelData.member_names.length > 0)
-                    ? groupRow.modelData.member_names.join(" + ")
-                    : groupRow.modelData.room_label
+                  text: (Array.isArray(groupRow.group.member_names) && groupRow.group.member_names.length > 0)
+                    ? groupRow.group.member_names.join(" + ")
+                    : groupRow.group.room_label
                   color: root.controller.foreground
                   font.family: root.controller.fontFamily
                   font.pixelSize: Style.font.bodySmall
@@ -137,10 +151,10 @@ Item {
                   width: parent.width
                   visible: text !== ""
                   textFormat: Text.PlainText
-                  text: groupRow.modelData.title
-                    ? ((groupRow.modelData.source_name ? groupRow.modelData.source_name + " · " : "")
-                      + groupRow.modelData.title
-                      + (groupRow.modelData.artist ? " — " + groupRow.modelData.artist : ""))
+                  text: groupRow.group.title
+                    ? ((groupRow.group.source_name ? groupRow.group.source_name + " · " : "")
+                      + groupRow.group.title
+                      + (groupRow.group.artist ? " — " + groupRow.group.artist : ""))
                     : root.strings.t("sonos.stopped")
                   color: root.controller.dimmer
                   font.family: root.controller.fontFamily
@@ -153,7 +167,7 @@ Item {
                 Layout.alignment: Qt.AlignVCenter
                 Layout.preferredWidth: Style.space(32)
                 textFormat: Text.PlainText
-                text: root.controller.formatPercent(groupRow.modelData.group_volume)
+                text: root.controller.formatPercent(root.controller.groupVolume(groupRow.group))
                 color: root.controller.dimmer
                 font.family: root.controller.fontFamily
                 font.pixelSize: Style.font.caption
@@ -171,7 +185,7 @@ Item {
               }
               onClicked: {
                 root.controller.setDrawerCursor(groupRow.index)
-                root.controller.selectedCoordUuid = groupRow.modelData.coord_uuid
+                root.controller.selectedCoordUuid = groupRow.group.coord_uuid
               }
             }
           }
@@ -200,17 +214,23 @@ Item {
         spacing: Style.space(5)
 
         Repeater {
-          model: root.visible && root.showGrouping ? root.controller.speakers : []
+          model: root.visible && root.showGrouping ? root.controller.speakerUuids : []
 
           CursorSurface {
             id: spRow
             required property var modelData
             required property int index
 
+            readonly property var speaker: root.controller.speakerByUuid(modelData) || ({
+              uuid: modelData,
+              name: "",
+              volume: 0,
+              muted: false
+            })
             readonly property int rowIndex: root.roomCount + index
-            readonly property bool inGroup: Model.isSpeakerInGroup(root.controller.activeGroup, modelData)
+            readonly property bool inGroup: Model.isSpeakerInGroup(root.controller.activeGroup, speaker)
             readonly property bool isCoord: root.controller.activeGroup !== null
-              && root.controller.activeGroup.coord_uuid === modelData.uuid
+              && root.controller.activeGroup.coord_uuid === speaker.uuid
             readonly property bool canToggleGroup: !(isCoord && root.controller.activeGroup !== null
               && (root.controller.activeGroup.member_uuids || []).length <= 1)
 
@@ -265,7 +285,7 @@ Item {
                     cursorShape: spRow.canToggleGroup ? Qt.PointingHandCursor : Qt.ArrowCursor
                     onClicked: {
                       root.controller.setDrawerCursor(spRow.rowIndex)
-                      root.controller.toggleSpeakerMembership(spRow.modelData, spRow.inGroup, spRow.canToggleGroup)
+                      root.controller.toggleSpeakerMembership(spRow.speaker, spRow.inGroup, spRow.canToggleGroup)
                     }
                   }
                 }
@@ -275,7 +295,7 @@ Item {
                   Layout.minimumWidth: 0
                   Layout.alignment: Qt.AlignVCenter
                   textFormat: Text.PlainText
-                  text: spRow.modelData.name
+                  text: spRow.speaker.name
                   color: spRow.inGroup ? root.controller.foreground : root.controller.dim
                   font.family: root.controller.fontFamily
                   font.pixelSize: Style.font.bodySmall
@@ -287,7 +307,7 @@ Item {
                     cursorShape: spRow.canToggleGroup ? Qt.PointingHandCursor : Qt.ArrowCursor
                     onClicked: {
                       root.controller.setDrawerCursor(spRow.rowIndex)
-                      root.controller.toggleSpeakerMembership(spRow.modelData, spRow.inGroup, spRow.canToggleGroup)
+                      root.controller.toggleSpeakerMembership(spRow.speaker, spRow.inGroup, spRow.canToggleGroup)
                     }
                   }
                 }
@@ -313,8 +333,8 @@ Item {
                   Layout.alignment: Qt.AlignVCenter
                   Layout.preferredWidth: Style.space(18)
                   textFormat: Text.PlainText
-                  text: Model.volumeIcon(spRow.modelData.volume, spRow.modelData.muted)
-                  color: spRow.modelData.muted ? root.controller.dimmer : root.controller.dim
+                  text: Model.volumeIcon(root.controller.memberVolume(spRow.speaker), spRow.speaker.muted)
+                  color: spRow.speaker.muted ? root.controller.dimmer : root.controller.dim
                   font.family: root.controller.fontFamily
                   font.pixelSize: Style.font.caption
                   horizontalAlignment: Text.AlignHCenter
@@ -324,13 +344,14 @@ Item {
                     cursorShape: Qt.PointingHandCursor
                     onClicked: {
                       root.controller.setDrawerCursor(spRow.rowIndex)
-                      root.controller.toggleSpeakerMute(spRow.modelData)
+                      root.controller.toggleSpeakerMute(spRow.speaker)
                     }
                   }
                 }
 
                 SonosSlider {
                   id: spVolSlider
+                  property bool _countedDrag: false
                   bar: root.controller.bar
                   Layout.fillWidth: true
                   Layout.minimumWidth: Style.space(60)
@@ -341,23 +362,37 @@ Item {
                   integer: true
                   knobSize: Style.space(11)
                   trackHeight: Style.space(3)
-                  value: spRow.modelData.volume || 0
-                  opacity: spRow.modelData.muted ? 0.5 : 1.0
+                  value: root.controller.memberVolume(spRow.speaker)
+                  opacity: spRow.speaker.muted ? 0.5 : 1.0
+                  onDraggingChanged: {
+                    if (dragging !== _countedDrag) {
+                      _countedDrag = dragging
+                      root.controller.setVolumeDragging(dragging)
+                    }
+                  }
+                  Component.onDestruction: {
+                    if (_countedDrag) {
+                      _countedDrag = false
+                      root.controller.setVolumeDragging(false)
+                    }
+                  }
                   onMoved: function(v) {
+                    root.controller.previewMemberVolume(spRow.speaker, v, false)
                     root.controller.queueVolumeChange({
                       cmd: "set_speaker_volume",
-                      speaker_uuid: spRow.modelData.uuid,
+                      speaker_uuid: spRow.speaker.uuid,
                       volume: Math.round(v)
                     })
                   }
                   onReleased: function(v) {
+                    root.controller.previewMemberVolume(spRow.speaker, v, false)
                     root.controller.sendCommand({
                       cmd: "set_speaker_volume",
-                      speaker_uuid: spRow.modelData.uuid,
+                      speaker_uuid: spRow.speaker.uuid,
                       volume: Math.round(v)
                     })
                   }
-                  onRightClicked: root.controller.toggleSpeakerMute(spRow.modelData)
+                  onRightClicked: root.controller.toggleSpeakerMute(spRow.speaker)
                 }
               }
             }

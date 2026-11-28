@@ -52,9 +52,30 @@ empty workspace, drives the panel with simulated keys, nudges the room's group
 volume up and back, and restores everything afterwards. Needs `wtype` and
 `wf-recorder` (`omarchy pkg add wtype wf-recorder`).
 
-## Testing
+## Real-time push (optional)
+
+`sonos-mpris.py` automatically detects whether UPnP GENA push notifications from
+your Sonos speakers can reach the host on port `14001/tcp`. If blocked by a
+firewall, it closes the listener cleanly and falls back to fast SOAP polling.
+
+To enable instant real-time push updates with UFW (adjust the subnet if your LAN
+uses `10.0.0.0/8` or `172.16.0.0/12`):
 
 ```bash
+sudo ufw allow from 192.168.0.0/16 to any port 14001 proto tcp comment 'Sonos GENA push'
+omarchy restart shell
+```
+
+Set `MC_SONOS_GENA_PORT` to override the listener port (default `14001`, or `0`
+for an ephemeral port).
+
+## Diagnostics & Testing
+
+```bash
+~/.config/omarchy/plugins/mc.sonos/sonos-mpris.py --status
 python3 -m unittest discover -s ~/.config/omarchy/plugins/mc.sonos/test -v
 omarchy plugin validate ~/.config/omarchy/plugins/mc.sonos
 ```
+
+Set `MC_SONOS_DEBUG=1` in the daemon environment to log SOAP/GENA/recovery
+diagnostics to stderr.

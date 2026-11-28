@@ -17,6 +17,8 @@ Panel {
   property bool inTraySection: false
   readonly property bool vertical: bar ? bar.vertical : false
   readonly property int barSize: bar ? bar.barSize : Style.bar.sizeHorizontal
+  readonly property bool barHidden: !!(bar && (bar.barHidden === true
+    || (bar.shell && bar.shell.bar && bar.shell.bar.barHidden === true)))
 
   Commons.Translations { id: sonosStrings; directory: Qt.resolvedUrl("i18n") }
 
@@ -53,12 +55,27 @@ Panel {
   property string queueQuery: ""
   property var libraryItems: []
   property var queueItems: []
+  property string queueCoordUuid: ""
+  property string _queueFetchedCoord: ""
+  property bool genaActive: false
+  property bool _speakersReady: false
+  property bool _openedSyncDone: false
+  property bool _openedSyncPending: false
+  property int _libraryVersion: -1
+  property int _volumeDragCount: 0
+  property string _pendingRefreshCoord: ""
+  property bool _pendingRefreshFull: false
+  property bool _pendingRefreshIncludeSpeakers: true
   property int livePositionSec: 0
+  property double lastSeekMs: 0
+  property double _lastStateAtMs: 0
+  property string _lastTrackKey: ""
   property real barWheelAccumulator: 0
 
   readonly property bool stateLoading: rpc.stateLoading
   readonly property bool libraryLoading: rpc.libraryLoading
   readonly property bool queueLoading: rpc.queueLoading
+  readonly property bool needsMemberAudio: (expanded && activeTab === "speakers") || memberVolumesShown
 
   // Unified keyboard + mouse cursor model (matches omarchy.audio / omarchy.bluetooth):
   //   focusSection: "master" | "drawer"
@@ -68,27 +85,41 @@ Panel {
   property int selectedIndex: -1
 
   readonly property var activeGroup: Model.findActiveGroup(groups, selectedCoordUuid, preferredRoom)
+  readonly property string activeCoordUuid: activeGroup ? activeGroup.coord_uuid : ""
   readonly property var speakersRows: Model.buildSpeakersRows(groups, speakers, activeGroup)
 
   // Grouped-room volumes, shown under the group slider while it is being set (like the Sonos app).
+  readonly property var groupsByUuid: Model.indexByKey(groups, "coord_uuid")
+  readonly property var speakersByUuid: Model.indexByKey(speakers, "uuid")
   readonly property var groupMembers: Model.groupMembers(activeGroup, speakers)
   readonly property bool isMultiRoomGroup: groupMembers.length > 1
-  // A string only changes when membership changes, so the room rows are not
-  // rebuilt (and a drag is not cut off) every time fresh state arrives.
+  // Stable string keys only change when topology/membership changes, so Repeater
+  // rows are not destroyed (and slider drags are not cut off) on every poll tick.
+  readonly property string groupKey: groups.map(function(g) { return g.coord_uuid }).join(",")
+  readonly property var groupUuids: groupKey === "" ? [] : groupKey.split(",")
+  readonly property string speakerKey: speakers.map(function(sp) { return sp.uuid }).join(",")
+  readonly property var speakerUuids: speakerKey === "" ? [] : speakerKey.split(",")
   readonly property string groupMemberKey: groupMembers.map(function(sp) { return sp.uuid }).join(",")
   readonly property var groupMemberUuids: groupMemberKey === "" ? [] : groupMemberKey.split(",")
 
+  function groupByUuid(uuid) {
+    return groupsByUuid[uuid] || null
+  }
+
   function speakerByUuid(uuid) {
-    for (var i = 0; i < speakers.length; i++)
-      if (speakers[i].uuid === uuid) return speakers[i]
-    return null
+    return speakersByUuid[uuid] || null
   }
   property bool memberVolumesShown: false
   property bool masterVolumeHovered: false
   property bool memberVolumesHovered: false
   property var memberVolumeBase: null
+  property var groupVolumePreview: ({})
   property var memberVolumePreview: ({})
   property double lastVolumeAdjustMs: 0
+
+  function setVolumeDragging(isDragging) {
+    _volumeDragCount = Math.max(0, _volumeDragCount + (isDragging ? 1 : -1))
+  }
 
   function revealMemberVolumes() {
     if (!isMultiRoomGroup) return
@@ -102,33 +133,60 @@ Panel {
     masterVolumeHovered = false
     memberVolumesHovered = false
     memberVolumeBase = null
-    memberVolumePreview = ({})
+    if (!memberVolumeSettle.running && _volumeDragCount <= 0)
+      memberVolumePreview = ({})
   }
 
-  // Move the room sliders along with the group slider until the speakers report real values.
+  function groupVolume(group) {
+    if (!group) return 0
+    var preview = groupVolumePreview[group.coord_uuid]
+    return preview !== undefined ? preview : (group.group_volume || 0)
+  }
+
+  // Move the sliders optimistically until the speakers report real values.
   function previewGroupVolume(volume) {
     lastVolumeAdjustMs = Date.now()
     memberVolumeSettle.restart()
-    if (!isMultiRoomGroup || !activeGroup) return
+    if (!activeGroup) return
+    var target = Math.max(0, Math.min(100, Math.round(volume)))
+    var prevBaseGroup = groupVolume(activeGroup)
+    var nextGroup = {}
+    for (var gk in groupVolumePreview) nextGroup[gk] = groupVolumePreview[gk]
+    nextGroup[activeGroup.coord_uuid] = target
+    groupVolumePreview = nextGroup
+    if (!isMultiRoomGroup) return
     if (!memberVolumeBase) {
       var vols = {}
       for (var i = 0; i < groupMembers.length; i++)
         vols[groupMembers[i].uuid] = memberVolume(groupMembers[i])
-      memberVolumeBase = { group: activeGroup.group_volume || 0, volumes: vols }
+      memberVolumeBase = { group: prevBaseGroup, volumes: vols }
     }
-    memberVolumePreview = Model.predictMemberVolumes(memberVolumeBase.volumes, memberVolumeBase.group, volume)
+    memberVolumePreview = Model.predictMemberVolumes(memberVolumeBase.volumes, memberVolumeBase.group, target)
     revealMemberVolumes()
   }
 
-  function previewMemberVolume(speaker, volume) {
+  function previewMemberVolume(speaker, volume, reveal) {
+    if (!speaker) return
     lastVolumeAdjustMs = Date.now()
     memberVolumeSettle.restart()
     memberVolumeBase = null
     var next = {}
     for (var k in memberVolumePreview) next[k] = memberVolumePreview[k]
-    next[speaker.uuid] = Math.round(volume)
+    next[speaker.uuid] = Math.max(0, Math.min(100, Math.round(volume)))
     memberVolumePreview = next
-    revealMemberVolumes()
+    if (activeGroup && groupVolumePreview[activeGroup.coord_uuid] !== undefined
+        && Model.isSpeakerInGroup(activeGroup, speaker)) {
+      var sum = 0
+      var count = groupMembers.length
+      for (var i = 0; i < count; i++) sum += memberVolume(groupMembers[i])
+      if (count > 0) {
+        var nextGroup = {}
+        for (var gk in groupVolumePreview) nextGroup[gk] = groupVolumePreview[gk]
+        nextGroup[activeGroup.coord_uuid] = Math.max(0, Math.min(100, Math.round(sum / count)))
+        groupVolumePreview = nextGroup
+      }
+    }
+    if (reveal !== false) revealMemberVolumes()
   }
 
   function memberVolume(speaker) {
@@ -264,7 +322,7 @@ Panel {
       // row, h/l adjusts that slider (just like omarchy.audio). Otherwise h/l
       // seeks the current track.
       if (cursorActive && focusSection === "master" && activeGroup) {
-        var nextGroupVol = Math.max(0, Math.min(100, (activeGroup.group_volume || 0) + dx * volumeStep))
+        var nextGroupVol = Math.max(0, Math.min(100, groupVolume(activeGroup) + dx * volumeStep))
         previewGroupVolume(nextGroupVol)
         sendCommand({ cmd: "set_group_volume", coord_uuid: activeGroup.coord_uuid, volume: nextGroupVol })
         return
@@ -273,7 +331,8 @@ Panel {
           && selectedIndex >= 0 && selectedIndex < speakersRows.length) {
         var row = speakersRows[selectedIndex]
         if (row.kind === "speaker" && row.inGroup) {
-          var nextSpVol = Math.max(0, Math.min(100, (row.speaker.volume || 0) + dx * volumeStep))
+          var nextSpVol = Math.max(0, Math.min(100, memberVolume(row.speaker) + dx * volumeStep))
+          previewMemberVolume(row.speaker, nextSpVol, false)
           sendCommand({ cmd: "set_speaker_volume", speaker_uuid: row.speaker.uuid, volume: nextSpVol })
           return
         }
@@ -281,6 +340,7 @@ Panel {
       if (activeGroup && (activeGroup.duration_sec || 0) > 0) {
         var dur = activeGroup.duration_sec || 0
         var nextSec = Math.max(0, Math.min(dur, livePositionSec + dx * seekStep))
+        lastSeekMs = Date.now()
         livePositionSec = nextSec
         sendCommand({ cmd: "seek", coord_uuid: activeGroup.coord_uuid, seconds: nextSec })
       }
@@ -407,27 +467,33 @@ Panel {
     }
   }
 
-  function fetchState(forceTopology) {
-    rpc.fetchState(forceTopology, groups.length === 0)
+  function fetchState(forceTopology, opts) {
+    var options = opts || ({})
+    if (options.selectedCoordUuid === undefined && activeGroup)
+      options.selectedCoordUuid = activeGroup.coord_uuid
+    rpc.fetchState(forceTopology, groups.length === 0, options)
   }
 
   function sendCommand(payload) {
+    if (payload && (payload.cmd === "previous" || payload.cmd === "next"
+        || payload.cmd === "play_queue_track" || payload.cmd === "play_item")) {
+      lastSeekMs = 0
+    }
     rpc.sendCommand(payload)
-    if (opened) postCommandRefresh.restart()
   }
 
   function queueVolumeChange(payload) {
     rpc.queueVolumeChange(payload)
-    if (opened) postCommandRefresh.restart()
   }
 
   function fetchLibrary(force) {
     rpc.fetchLibrary(force)
   }
 
-  function fetchQueue() {
+  function fetchQueue(force) {
     if (!activeGroup) return
-    rpc.fetchQueue(activeGroup.coord_uuid, queueLimit)
+    _queueFetchedCoord = activeGroup.coord_uuid
+    rpc.fetchQueue(activeGroup.coord_uuid, queueLimit, !!force)
   }
 
   function refresh() {
@@ -439,17 +505,34 @@ Panel {
       cursorActive = false
       focusSection = "master"
       selectedIndex = -1
+      _openedSyncDone = false
+      _openedSyncPending = false
       resetPointerGate()
-      fetchState(false)
+      // Persistent event stream pushes cached state in <1ms. Always give that push
+      // a brief window before falling back so GENA opens need zero SOAP calls and
+      // non-GENA opens run exactly one live 1-wave refresh (never racing subscribe).
+      openSyncFallback.interval = (root.genaActive && root.groups.length > 0 && root._speakersReady) ? 150 : 40
+      openSyncFallback.restart()
       if (expanded) {
-        if (activeTab === "playlists" && libraryItems.length === 0) fetchLibrary(false)
-        if (activeTab === "queue" && activeGroup) fetchQueue()
+        if (activeTab === "playlists") fetchLibrary(false)
+        if (activeTab === "queue" && activeGroup) fetchQueue(false)
       }
       Qt.callLater(resetActiveDrawerScroll)
     } else {
+      openSyncFallback.stop()
+      _openedSyncDone = false
+      _openedSyncPending = false
+      _queueFetchedCoord = ""
       postCommandRefresh.stop()
+      memberVolumeSettle.stop()
+      _pendingRefreshCoord = ""
+      _pendingRefreshFull = false
+      _volumeDragCount = 0
+      lastSeekMs = 0
       rpc.flushPendingVolume()
       hideMemberVolumes()
+      groupVolumePreview = ({})
+      memberVolumePreview = ({})
       expanded = false
       activeTab = "speakers"
     }
@@ -462,26 +545,49 @@ Panel {
       selectedIndex = -1
       return
     }
-    if (activeTab === "playlists" && libraryItems.length === 0) fetchLibrary(false)
-    if (activeTab === "queue" && activeGroup) fetchQueue()
+    if (activeTab === "speakers" && !(root.genaActive && root.groups.length > 0 && root._speakersReady))
+      fetchState(false, { includeSpeakers: true })
+    if (activeTab === "playlists") fetchLibrary(false)
+    if (activeTab === "queue" && activeGroup) fetchQueue(false)
     clampCursor()
   }
 
   onActiveTabChanged: {
     if (!opened || !expanded) return
-    if (activeTab === "playlists" && libraryItems.length === 0) fetchLibrary(false)
-    if (activeTab === "queue" && activeGroup) fetchQueue()
+    if (activeTab === "speakers" && !(root.genaActive && root.groups.length > 0 && root._speakersReady))
+      fetchState(false, { includeSpeakers: true })
+    if (activeTab === "playlists") fetchLibrary(false)
+    if (activeTab === "queue" && activeGroup) fetchQueue(false)
     clampCursor()
     resetActiveDrawerScroll()
   }
 
-  onSelectedCoordUuidChanged: {
-    hideMemberVolumes()
-    if (opened && expanded && activeTab === "queue") fetchQueue()
+  onGroupMemberKeyChanged: {
+    memberVolumeBase = null
   }
 
-  onQueueLimitChanged: {
-    if (opened && expanded && activeTab === "queue") fetchQueue()
+  onActiveCoordUuidChanged: {
+    hideMemberVolumes()
+    groupVolumePreview = ({})
+    memberVolumePreview = ({})
+    queueCoordUuid = ""
+    _queueFetchedCoord = ""
+    queueItems = []
+    lastSeekMs = 0
+    if (activeGroup) {
+      var pos = activeGroup.position_sec || 0
+      var dur = activeGroup.duration_sec || 0
+      if (activeGroup.playback_status === "Playing" && dur > 0 && _lastStateAtMs > 0) {
+        var elapsed = Math.max(0, Math.floor((Date.now() - _lastStateAtMs) / 1000))
+        pos = Math.min(dur, pos + elapsed)
+      }
+      livePositionSec = pos
+      _lastTrackKey = activeGroup.coord_uuid + "|" + (activeGroup.track_num || 0) + "|" + (activeGroup.title || "")
+    } else {
+      livePositionSec = 0
+      _lastTrackKey = ""
+    }
+    if (opened && expanded && activeTab === "queue" && activeCoordUuid !== "") fetchQueue(false)
   }
 
   onPlaylistQueryChanged: clampCursor()
@@ -489,42 +595,163 @@ Panel {
 
   SonosRpc {
     id: rpc
+    subscribed: root.opened
 
-    // Values crossing a `var` signal arrive as Qt sequences (not JS Arrays), so
-    // Array.isArray() fails on them. Round-trip through JSON to get plain JS data.
-    onStateReceived: function(data) {
-      data = Model.toPlain(data)
-      if (Array.isArray(data.groups)) root.groups = data.groups
+    onEventStreamConnected: {
+      if (!root.opened || root._openedSyncPending) return
+      root._openedSyncDone = false
+      openSyncFallback.interval = (root.genaActive && root.groups.length > 0 && root._speakersReady) ? 150 : 40
+      openSyncFallback.restart()
+    }
+
+    onEventStreamDisconnected: {
+      if (!root.opened) return
+      root.genaActive = false
+      root._openedSyncDone = false
+      root._openedSyncPending = false
+      openSyncFallback.interval = 250
+      openSyncFallback.restart()
+    }
+
+    onStateFailed: {
+      if (root.opened && root._openedSyncPending) {
+        root._openedSyncPending = false
+        root._openedSyncDone = false
+      }
+    }
+
+    onStateReceived: function(rawJson) {
+      var data = null
+      try { data = JSON.parse(rawJson) } catch (e) { data = null }
+      if (!data || !data.ok) {
+        if (root.opened && root._openedSyncPending) {
+          root._openedSyncPending = false
+          root._openedSyncDone = false
+        }
+        return
+      }
+      root._openedSyncPending = false
+      if (root.opened) root.genaActive = !!data.gena_active && rpc.eventConnected
+      var speakersReady = (data.speakers_ready !== false) && Array.isArray(data.speakers) && data.speakers.length > 0
+      root._speakersReady = speakersReady
+      var hadGroups = root.groups.length > 0
+      if (Array.isArray(data.groups)) {
+        root.groups = data.groups
+        if (data.groups.length === 0) {
+          root.libraryItems = []
+          root.queueItems = []
+          root.queueCoordUuid = ""
+          root._queueFetchedCoord = ""
+        }
+      }
       if (Array.isArray(data.speakers)) root.speakers = data.speakers
+      var libVerChanged = false
+      if (data.library_version !== undefined) {
+        var nextLibVer = Number(data.library_version)
+        libVerChanged = root._libraryVersion >= 0 && nextLibVer !== root._libraryVersion
+        root._libraryVersion = nextLibVer
+      }
+      if (root.opened && root.expanded && root.activeTab === "playlists" && root.groups.length > 0
+          && (libVerChanged || (!hadGroups && root.libraryItems.length === 0))) {
+        root.fetchLibrary(false)
+      }
       // Real values replace the estimate once no change is in flight.
-      if (Date.now() - root.lastVolumeAdjustMs > 1000 && !memberVolumeSettle.running) {
+      if (Date.now() - root.lastVolumeAdjustMs > 1000 && !memberVolumeSettle.running && root._volumeDragCount <= 0) {
         root.memberVolumeBase = null
+        root.groupVolumePreview = ({})
         root.memberVolumePreview = ({})
       }
-      if (root.activeGroup) root.livePositionSec = root.activeGroup.position_sec || 0
+      if (root.activeGroup) {
+        var trackKey = root.activeGroup.coord_uuid + "|" + (root.activeGroup.track_num || 0) + "|" + (root.activeGroup.title || "")
+        var trackChanged = trackKey !== root._lastTrackKey
+        root._lastTrackKey = trackKey
+        if (trackChanged || (Date.now() - root.lastSeekMs > 1000))
+          root.livePositionSec = root.activeGroup.position_sec || 0
+      }
+      if (root.opened && !root._openedSyncDone) {
+        if (root.genaActive && Array.isArray(data.groups) && data.groups.length > 0 && speakersReady) {
+          root._openedSyncDone = true
+          openSyncFallback.stop()
+        } else if (data.cached || (Array.isArray(data.groups) && data.groups.length > 0 && !speakersReady)) {
+          root._openedSyncDone = true
+          root._openedSyncPending = true
+          openSyncFallback.stop()
+          root.fetchState(false, { includeSpeakers: true })
+        } else {
+          root._openedSyncDone = true
+          openSyncFallback.stop()
+        }
+      }
+      if (!data.cached || root.genaActive) root._lastStateAtMs = Date.now()
       root.clampCursor()
-      if (root.opened && root.expanded && root.activeTab === "queue" && root.queueItems.length === 0 && root.activeGroup)
-        root.fetchQueue()
+      if (root.opened && root.expanded && root.activeTab === "queue" && root.activeGroup
+          && !root.queueLoading
+          && root.queueCoordUuid !== root.activeGroup.coord_uuid
+          && root._queueFetchedCoord !== root.activeGroup.coord_uuid)
+        root.fetchQueue(false)
     }
 
-    onLibraryReceived: function(items) {
-      root.libraryItems = Model.toPlain(items) || []
+    onLibraryReceived: function(rawJson) {
+      var data = null
+      try { data = JSON.parse(rawJson) } catch (e) { return }
+      if (!data || !data.ok || !Array.isArray(data.items)) return
+      root.libraryItems = data.items
       root.clampCursor()
     }
 
-    onQueueReceived: function(items) {
-      root.queueItems = Model.toPlain(items) || []
+    onQueueReceived: function(rawJson) {
+      var data = null
+      try { data = JSON.parse(rawJson) } catch (e) { return }
+      if (!data || !data.ok || !Array.isArray(data.items)) return
+      if (data.coord_uuid && root.activeGroup && data.coord_uuid !== root.activeGroup.coord_uuid) return
+      root.queueItems = data.items
+      root.queueCoordUuid = data.coord_uuid || (root.activeGroup ? root.activeGroup.coord_uuid : "")
       root.clampCursor()
+    }
+
+    onCommandCompleted: function(cmd, coordUuid) {
+      if (!root.opened) return
+      if (cmd === "join_group" || cmd === "leave_group") {
+        root._pendingRefreshFull = true
+        root._pendingRefreshCoord = ""
+        root._pendingRefreshIncludeSpeakers = true
+        postCommandRefresh.interval = 220
+        postCommandRefresh.restart()
+        return
+      }
+      // When GENA push is active, Sonos pushes confirmed updates automatically except
+      // same-track restart (previous / play_queue_track) where RelTime is not evented.
+      var needsPosRefresh = (cmd === "previous" || cmd === "play_queue_track")
+      if (root.genaActive && !needsPosRefresh) return
+      if (root._pendingRefreshFull) {
+        root._pendingRefreshIncludeSpeakers = true
+        return
+      }
+      var target = coordUuid || (root.activeGroup ? root.activeGroup.coord_uuid : "")
+      var incSp = root.genaActive ? false : root.needsMemberAudio
+      if (postCommandRefresh.running) {
+        if (root._pendingRefreshCoord !== target) root._pendingRefreshCoord = ""
+        root._pendingRefreshIncludeSpeakers = root._pendingRefreshIncludeSpeakers || incSp
+      } else {
+        root._pendingRefreshCoord = target
+        root._pendingRefreshIncludeSpeakers = incSp
+      }
+      postCommandRefresh.interval = 100
+      postCommandRefresh.restart()
     }
   }
 
-  // On-demand RPC polling ONLY while the panel is open (zero idle work when closed).
+  // On-demand RPC polling ONLY while the panel is open (slows to a 15s safety
+  // heartbeat when GENA push events are active; zero idle work when closed).
   Timer {
     id: openPollTimer
-    interval: root.pollIntervalSec * 1000
+    interval: root.genaActive ? 15000 : (root.pollIntervalSec * 1000)
     running: root.opened
     repeat: true
-    onTriggered: root.fetchState(false)
+    onTriggered: {
+      if (Date.now() - root._lastStateAtMs >= (interval - 300))
+        root.fetchState(false, { includeSpeakers: root.needsMemberAudio })
+    }
   }
 
   // Hide the room volumes a few seconds after the last change, unless the pointer is on them.
@@ -533,8 +760,23 @@ Panel {
     interval: 3000
     repeat: false
     onTriggered: {
-      if (root.masterVolumeHovered || root.memberVolumesHovered) restart()
+      if (root.masterVolumeHovered || root.memberVolumesHovered || root._volumeDragCount > 0) restart()
       else root.hideMemberVolumes()
+    }
+  }
+
+  // Fallback live refresh on open if the persistent event stream did not deliver
+  // an active GENA state push promptly (e.g., daemon restarting or empty cache).
+  Timer {
+    id: openSyncFallback
+    interval: 50
+    repeat: false
+    onTriggered: {
+      if (root.opened && !root._openedSyncDone) {
+        root._openedSyncDone = true
+        root._openedSyncPending = true
+        root.fetchState(false, { includeSpeakers: true })
+      }
     }
   }
 
@@ -543,14 +785,45 @@ Panel {
     id: memberVolumeSettle
     interval: 1200
     repeat: false
-    onTriggered: if (root.opened) root.fetchState(false)
+    onTriggered: {
+      if (!root.opened) return
+      if (root._volumeDragCount > 0) {
+        restart()
+        return
+      }
+      if (root.genaActive) {
+        root.memberVolumeBase = null
+        root.groupVolumePreview = ({})
+        root.memberVolumePreview = ({})
+        return
+      }
+      if (root.activeGroup)
+        root.fetchState(false, { coordUuid: root.activeGroup.coord_uuid, includeSpeakers: true })
+      else
+        root.fetchState(false, { includeSpeakers: true })
+    }
   }
 
   Timer {
     id: postCommandRefresh
-    interval: 300
+    interval: 100
     repeat: false
-    onTriggered: if (root.opened) root.fetchState(false)
+    onTriggered: {
+      if (!root.opened) return
+      var full = root._pendingRefreshFull
+      var target = root._pendingRefreshCoord
+      var incSp = root._pendingRefreshIncludeSpeakers
+      root._pendingRefreshFull = false
+      root._pendingRefreshCoord = ""
+      root._pendingRefreshIncludeSpeakers = true
+      if (full) {
+        root.fetchState(true, { includeSpeakers: true })
+      } else if (target !== "") {
+        root.fetchState(false, { coordUuid: target, includeSpeakers: incSp })
+      } else {
+        root.fetchState(false, { includeSpeakers: incSp })
+      }
+    }
   }
 
   Timer {
@@ -593,7 +866,9 @@ Panel {
     function triggerPress(button) {
       if (root.bar) root.bar.hideTooltip(barTrigger)
       if (button === Qt.RightButton) {
-        if (root.activeMprisPlayer && root.activeMprisPlayer.canTogglePlaying) {
+        if (root.opened && root.activeGroup) {
+          root.sendCommand({ cmd: "play_pause", coord_uuid: root.activeGroup.coord_uuid })
+        } else if (root.activeMprisPlayer && root.activeMprisPlayer.canTogglePlaying) {
           root.activeMprisPlayer.togglePlaying()
         } else if (root.activeGroup) {
           root.sendCommand({ cmd: "play_pause", coord_uuid: root.activeGroup.coord_uuid })
@@ -658,10 +933,10 @@ Panel {
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
 
-          readonly property bool needsScroll: implicitWidth > scrollClip.width
+          readonly property bool needsScroll: root.effectiveLabelWidth > 0 && implicitWidth > scrollClip.width
 
           NumberAnimation on x {
-            running: root.scrollTrackInBar && barLabelText.needsScroll && root.isPlaying && root.visible && (!root.bar || !root.bar.barHidden) && !root.opened && !root.vertical && !Style.reduceMotion
+            running: root.scrollTrackInBar && barLabelText.needsScroll && root.isPlaying && root.visible && !root.barHidden && !root.opened && !root.vertical && !Style.reduceMotion
             onRunningChanged: if (!running) barLabelText.x = 0
             loops: Animation.Infinite
             duration: Style.duration(Math.max(6000, barLabelText.implicitWidth * 25))
@@ -686,7 +961,8 @@ Panel {
         if (res.steps === 0) return
         var step = res.steps * root.volumeStep
         if (root.opened && root.activeGroup) {
-          var nextVol = Math.max(0, Math.min(100, (root.activeGroup.group_volume || 0) + step))
+          var nextVol = Math.max(0, Math.min(100, root.groupVolume(root.activeGroup) + step))
+          root.previewGroupVolume(nextVol)
           root.queueVolumeChange({ cmd: "set_group_volume", coord_uuid: root.activeGroup.coord_uuid, volume: nextVol })
         } else if (root.activeMprisPlayer && root.activeMprisPlayer.volumeSupported) {
           var cur = Number(root.activeMprisPlayer.volume) || 0
@@ -722,6 +998,15 @@ Panel {
       property alias queueSearchField: queueDrawer.searchField
       property alias pointerGate: panelPointerGate
       readonly property bool searchFocused: playlistSearchField.activeFocus || queueSearchField.activeFocus
+
+      onSearchFocusedChanged: {
+        if (!searchFocused && root.opened) {
+          Qt.callLater(function() {
+            if (root.opened && !panelKeyCatcher.searchFocused)
+              panelKeyCatcher.forceActiveFocus()
+          })
+        }
+      }
 
       readonly property bool drawerVisible: root.expanded && root.groups.length > 0
       readonly property real activeDrawerHeight: {
@@ -1041,6 +1326,7 @@ Panel {
                 fillColor: root.accent
                 onReleased: function(v) {
                   if (!root.activeGroup) return
+                  root.lastSeekMs = Date.now()
                   root.livePositionSec = Math.round(v)
                   root.sendCommand({ cmd: "seek", coord_uuid: root.activeGroup.coord_uuid, seconds: Math.round(v) })
                 }
@@ -1165,7 +1451,7 @@ Panel {
 
                 Button {
                   Layout.alignment: Qt.AlignVCenter
-                  iconText: Model.volumeIcon(root.activeGroup ? root.activeGroup.group_volume : 0, root.activeGroup && root.activeGroup.group_muted)
+                  iconText: Model.volumeIcon(root.groupVolume(root.activeGroup), root.activeGroup && root.activeGroup.group_muted)
                   bordered: false
                   foreground: root.activeGroup && root.activeGroup.group_muted ? root.dimmer : root.foreground
                   horizontalPadding: Style.space(4)
@@ -1183,6 +1469,7 @@ Panel {
 
                 SonosSlider {
                   id: masterVolSlider
+                  property bool _countedDrag: false
                   bar: root.bar
                   Layout.fillWidth: true
                   Layout.minimumWidth: Style.space(60)
@@ -1191,9 +1478,21 @@ Panel {
                   maximum: 100
                   step: root.volumeStep
                   integer: true
-                  value: root.activeGroup ? (root.activeGroup.group_volume || 0) : 0
+                  value: root.groupVolume(root.activeGroup)
                   opacity: root.activeGroup && root.activeGroup.group_muted ? 0.5 : 1.0
-                  onDraggingChanged: if (dragging) root.revealMemberVolumes()
+                  onDraggingChanged: {
+                    if (dragging !== _countedDrag) {
+                      _countedDrag = dragging
+                      root.setVolumeDragging(dragging)
+                    }
+                    if (dragging) root.revealMemberVolumes()
+                  }
+                  Component.onDestruction: {
+                    if (_countedDrag) {
+                      _countedDrag = false
+                      root.setVolumeDragging(false)
+                    }
+                  }
                   onMoved: function(v) {
                     if (!root.activeGroup) return
                     root.previewGroupVolume(v)
@@ -1286,6 +1585,7 @@ Panel {
 
                   SonosSlider {
                     id: memberSlider
+                    property bool _countedDrag: false
                     bar: root.bar
                     Layout.fillWidth: true
                     Layout.minimumWidth: Style.space(60)
@@ -1298,7 +1598,19 @@ Panel {
                     trackHeight: Style.space(3)
                     value: root.memberVolume(memberRow.speaker)
                     opacity: memberRow.speaker.muted ? 0.5 : 1.0
-                    onDraggingChanged: if (dragging) root.revealMemberVolumes()
+                    onDraggingChanged: {
+                      if (dragging !== _countedDrag) {
+                        _countedDrag = dragging
+                        root.setVolumeDragging(dragging)
+                      }
+                      if (dragging) root.revealMemberVolumes()
+                    }
+                    Component.onDestruction: {
+                      if (_countedDrag) {
+                        _countedDrag = false
+                        root.setVolumeDragging(false)
+                      }
+                    }
                     onMoved: function(v) {
                       root.previewMemberVolume(memberRow.speaker, v)
                       root.queueVolumeChange({ cmd: "set_speaker_volume", speaker_uuid: memberRow.speaker.uuid, volume: Math.round(v) })

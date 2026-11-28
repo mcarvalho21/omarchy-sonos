@@ -49,16 +49,35 @@ function isSpeakerInGroup(group, speaker) {
   return members.indexOf(speaker.uuid) !== -1
 }
 
+function _extractMprisRoomName(identity) {
+  var s = String(identity || "").trim()
+  var prefix = "sonos · "
+  if (s.toLowerCase().indexOf(prefix) === 0) s = s.slice(prefix.length).trim()
+  return s.replace(/\s*\(\+\d+\)\s*$/, "").trim().toLowerCase()
+}
+
 function findActiveGroup(groups, selectedCoordUuid, preferredRoom) {
   if (!groups || groups.length === 0) return null
   if (selectedCoordUuid !== "") {
     for (var i = 0; i < groups.length; i++)
       if (groups[i].coord_uuid === selectedCoordUuid) return groups[i]
   }
-  if (preferredRoom !== "") {
+  var pref = String(preferredRoom || "").trim().toLowerCase()
+  if (pref !== "") {
     for (var r = 0; r < groups.length; r++) {
-      if (groups[r].coord_name === preferredRoom || groups[r].coord_uuid === preferredRoom)
+      if (String(groups[r].coord_name || "").toLowerCase() === pref
+          || String(groups[r].coord_uuid || "").toLowerCase() === pref)
         return groups[r]
+    }
+    for (var m = 0; m < groups.length; m++) {
+      var names = groups[m].member_names || []
+      for (var n = 0; n < names.length; n++) {
+        if (String(names[n] || "").toLowerCase() === pref) return groups[m]
+      }
+      var uuids = groups[m].member_uuids || []
+      for (var u = 0; u < uuids.length; u++) {
+        if (String(uuids[u] || "").toLowerCase() === pref) return groups[m]
+      }
     }
   }
   for (var j = 0; j < groups.length; j++)
@@ -72,13 +91,13 @@ function findActiveMprisPlayer(mprisPlayers, preferredRoom) {
   if (!mprisPlayers || mprisPlayers.length === 0) return null
   var fallback = null
   var preferred = null
-  var pref = String(preferredRoom || "").toLowerCase()
+  var pref = String(preferredRoom || "").trim().toLowerCase()
   for (var i = 0; i < mprisPlayers.length; i++) {
     var p = mprisPlayers[i]
     if (!p) continue
     var dbus = String(p.dbusName || "")
     if (dbus.indexOf("org.mpris.MediaPlayer2.sonos_") !== 0) continue
-    if (pref !== "" && String(p.identity || "").toLowerCase().indexOf(pref) !== -1) {
+    if (pref !== "" && _extractMprisRoomName(p.identity) === pref) {
       if (p.isPlaying) return p
       if (!preferred && (p.trackTitle || p.trackArtist)) preferred = p
     }
@@ -148,15 +167,15 @@ function buildSpeakersRows(groups, speakers, activeGroup) {
   return rows
 }
 
-// Convert values received through a QML `var` signal (Qt sequences/maps) back
-// into plain JS objects and arrays so Array.isArray() and Array methods work.
-function toPlain(value) {
-  if (value === null || value === undefined) return value
-  try {
-    return JSON.parse(JSON.stringify(value))
-  } catch (e) {
-    return value
+function indexByKey(items, key) {
+  var map = {}
+  if (!items) return map
+  for (var i = 0; i < items.length; i++) {
+    var item = items[i]
+    if (item && item[key] !== undefined && item[key] !== null)
+      map[item[key]] = item
   }
+  return map
 }
 
 // Speakers in a group, coordinator first, in the group's member order.
