@@ -351,6 +351,7 @@ Item {
 
                 SonosSlider {
                   id: spVolSlider
+                  property bool _countedDrag: false
                   bar: root.controller.bar
                   Layout.fillWidth: true
                   Layout.minimumWidth: Style.space(60)
@@ -363,6 +364,18 @@ Item {
                   trackHeight: Style.space(3)
                   value: root.controller.memberVolume(spRow.speaker)
                   opacity: spRow.speaker.muted ? 0.5 : 1.0
+                  onDraggingChanged: {
+                    if (dragging !== _countedDrag) {
+                      _countedDrag = dragging
+                      root.controller.setVolumeDragging(dragging)
+                    }
+                  }
+                  Component.onDestruction: {
+                    if (_countedDrag) {
+                      _countedDrag = false
+                      root.controller.setVolumeDragging(false)
+                    }
+                  }
                   onMoved: function(v) {
                     root.controller.previewMemberVolume(spRow.speaker, v, false)
                     root.controller.queueVolumeChange({

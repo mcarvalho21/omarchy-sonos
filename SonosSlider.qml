@@ -124,7 +124,7 @@ Item {
       root.moved(next)
     }
     onReleased: function(mouse) {
-      if (mouse.button !== Qt.LeftButton) return
+      if (!root.dragging) return
       root.dragging = false
       root.released(root.liveValue)
       root.liveValue = root.value

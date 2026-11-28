@@ -20,17 +20,22 @@ Item {
   property bool stateLoading: false
   property bool libraryLoading: false
   property bool queueLoading: false
+  readonly property bool eventConnected: eventSock.connected
 
   // Emit raw JSON strings so listeners parse once into native JS objects/arrays
   // without crossing a `var` signal boundary into Qt sequences.
   signal stateReceived(string rawJson)
+  signal stateFailed()
   signal libraryReceived(string rawJson)
   signal queueReceived(string rawJson)
   signal commandCompleted(string cmd, string coordUuid)
+  signal eventStreamConnected()
+  signal eventStreamDisconnected()
 
   property var _cmdQueue: []
   property var _pendingVolumes: ({})
   property var _pendingStateFetch: null
+  property var _pendingLibraryFetch: null
   property var _pendingQueueFetch: null
   property var _activeCmd: null
 
@@ -98,18 +103,30 @@ Item {
   }
 
   function _drainPendingStateFetch() {
-    if (!_pendingStateFetch || stateChan.busy) return
+    if (!subscribed || !_pendingStateFetch || stateChan.busy) return
     var next = _pendingStateFetch
     _pendingStateFetch = null
     fetchState(next.forceTopology, next.showSpinner, next)
   }
 
   function fetchLibrary(force) {
-    if (!socketPath || libraryChan.busy) return
+    if (!socketPath) return
+    if (libraryChan.busy) {
+      var prevForce = _pendingLibraryFetch ? _pendingLibraryFetch.force : false
+      _pendingLibraryFetch = { force: prevForce || !!force }
+      return
+    }
     libraryLoading = true
     if (!libraryChan.send({ cmd: "browse_library", force: !!force })) {
       libraryLoading = false
     }
+  }
+
+  function _drainPendingLibraryFetch() {
+    if (!subscribed || !_pendingLibraryFetch || libraryChan.busy) return
+    var next = _pendingLibraryFetch
+    _pendingLibraryFetch = null
+    fetchLibrary(next.force)
   }
 
   function fetchQueue(coordUuid, limit, force) {
@@ -128,10 +145,16 @@ Item {
   }
 
   function _drainPendingQueueFetch() {
-    if (!_pendingQueueFetch || queueChan.busy) return
+    if (!subscribed || !_pendingQueueFetch || queueChan.busy) return
     var next = _pendingQueueFetch
     _pendingQueueFetch = null
     fetchQueue(next.coordUuid, next.limit, next.force)
+  }
+
+  function _isAudioOrTopoBarrier(cmd) {
+    return cmd === "set_group_volume" || cmd === "set_speaker_volume"
+        || cmd === "set_group_mute" || cmd === "set_speaker_mute"
+        || cmd === "join_group" || cmd === "leave_group"
   }
 
   function sendCommand(payload) {
@@ -139,17 +162,46 @@ Item {
     // Clear any stale debounced drag update for the same target so it cannot
     // overwrite a final release or direct volume step.
     var volKey = _volumeKey(payload)
-    if (volKey !== "") {
-      if (_pendingVolumes[volKey]) {
-        delete _pendingVolumes[volKey]
-        if (!_hasPendingVolumes() && volumeDebounce.running) volumeDebounce.stop()
+    if (volKey !== "" && _pendingVolumes[volKey]) {
+      delete _pendingVolumes[volKey]
+      if (!_hasPendingVolumes() && volumeDebounce.running) volumeDebounce.stop()
+    }
+    // Flush other targets' debounced volumes before enqueuing an audio/topology
+    // barrier so an older pending volume cannot fire later and invert order.
+    if (_isAudioOrTopoBarrier(payload.cmd) && _hasPendingVolumes()) {
+      if (volumeDebounce.running) volumeDebounce.stop()
+      var pending = _pendingVolumes
+      _pendingVolumes = ({})
+      for (var k in pending) {
+        sendCommand(pending[k])
       }
+    }
+    if (volKey !== "") {
       var targetKey = payload.cmd === "set_group_volume" ? "coord_uuid" : "speaker_uuid"
       for (var i = _cmdQueue.length - 1; i >= 0; i--) {
-        if (_cmdQueue[i].cmd === payload.cmd && _cmdQueue[i][targetKey] === payload[targetKey]) {
+        var qv = _cmdQueue[i]
+        if (qv.cmd === payload.cmd && qv[targetKey] === payload[targetKey]) {
           _cmdQueue[i] = payload
           drainCommands()
           return
+        }
+        if (_isAudioOrTopoBarrier(qv.cmd)) {
+          break
+        }
+      }
+    } else if (payload.cmd === "seek") {
+      for (var j = _cmdQueue.length - 1; j >= 0; j--) {
+        var qc = _cmdQueue[j]
+        if (qc.cmd === "seek" && qc.coord_uuid === payload.coord_uuid) {
+          _cmdQueue[j] = payload
+          drainCommands()
+          return
+        }
+        if (qc.cmd === "previous" || qc.cmd === "next" || qc.cmd === "stop"
+            || qc.cmd === "play_pause" || qc.cmd === "play_queue_track"
+            || qc.cmd === "play_item" || qc.cmd === "join_group"
+            || qc.cmd === "leave_group") {
+          break
         }
       }
     }
@@ -206,10 +258,13 @@ Item {
   onSubscribedChanged: {
     if (subscribed && socketPath !== "") {
       eventReconnect.stop()
-      if (!eventSock.connected) eventSock.connected = true
+      eventSock.connected = true
     } else {
       eventReconnect.stop()
-      if (eventSock.connected) eventSock.connected = false
+      _pendingStateFetch = null
+      _pendingLibraryFetch = null
+      _pendingQueueFetch = null
+      eventSock.connected = false
     }
   }
 
@@ -228,16 +283,33 @@ Item {
     }
 
     onConnectionStateChanged: {
-      if (connected && root.subscribed) {
+      if (connected) {
+        if (!root.subscribed) {
+          Qt.callLater(function() {
+            if (!root.subscribed && eventSock.connected) eventSock.connected = false
+          })
+          return
+        }
         write('{"cmd":"subscribe"}\n')
         flush()
-      } else if (!connected && root.subscribed) {
-        eventReconnect.restart()
+        root.eventStreamConnected()
+      } else if (root.subscribed) {
+        if (!eventReconnect.running) {
+          root.eventStreamDisconnected()
+          eventReconnect.restart()
+        }
       }
     }
 
     onError: function() {
-      if (root.subscribed) eventReconnect.restart()
+      if (root.subscribed) {
+        Qt.callLater(function() {
+          if (root.subscribed && !eventSock.connected && !eventReconnect.running) {
+            root.eventStreamDisconnected()
+            eventReconnect.restart()
+          }
+        })
+      }
     }
   }
 
@@ -246,6 +318,8 @@ Item {
     property string socketPath: ""
     property int timeoutMs: 8000
     property bool busy: false
+    property bool reconnecting: false
+    property bool gotResponse: false
     property string pendingLine: ""
     property int requestSeq: 0
 
@@ -256,14 +330,15 @@ Item {
       if (busy || !socketPath) return false
       requestSeq += 1
       pendingLine = JSON.stringify(payloadObj)
+      gotResponse = false
       busy = true
       timeoutTimer.restart()
+      // Daemon closes each non-subscribe connection after one response; always open a fresh socket.
       if (sock.connected) {
-        var line = pendingLine
-        pendingLine = ""
-        sock.write(line + "\n")
-        sock.flush()
+        reconnecting = true
+        sock.connected = false
       } else {
+        reconnecting = false
         sock.connected = true
       }
       return true
@@ -271,9 +346,11 @@ Item {
 
     function finish(ok, line) {
       timeoutTimer.stop()
+      reconnecting = false
+      gotResponse = false
       pendingLine = ""
       busy = false
-      if (sock.connected) sock.connected = false
+      sock.connected = false
       if (ok) rawResponse(line)
       else failed()
     }
@@ -293,29 +370,60 @@ Item {
       parser: SplitParser {
         splitMarker: "\n"
         onRead: function(line) {
-          if (!ch.busy) return
+          if (!ch.busy || ch.gotResponse) return
+          ch.gotResponse = true
+          var seq = ch.requestSeq
           var text = String(line || "").trim()
-          ch.finish(text !== "", text)
+          // Defer teardown so readyRead finishes unwinding cleanly in Quickshell.
+          Qt.callLater(function() {
+            if (ch.busy && ch.requestSeq === seq) ch.finish(text !== "", text)
+          })
         }
       }
 
       onConnectionStateChanged: {
-        if (connected && ch.busy && ch.pendingLine !== "") {
-          var line = ch.pendingLine
-          ch.pendingLine = ""
-          write(line + "\n")
-          flush()
-        } else if (!connected && ch.busy) {
+        if (connected) {
+          if (!ch.busy) {
+            Qt.callLater(function() {
+              if (!ch.busy && sock.connected) sock.connected = false
+            })
+            return
+          }
+          if (ch.pendingLine !== "") {
+            var line = ch.pendingLine
+            ch.pendingLine = ""
+            write(line + "\n")
+            flush()
+          }
+        } else if (ch.busy) {
+          if (ch.reconnecting) {
+            var rseq = ch.requestSeq
+            Qt.callLater(function() {
+              if (ch.busy && ch.reconnecting && ch.requestSeq === rseq && !sock.connected) {
+                ch.reconnecting = false
+                sock.connected = true
+              }
+            })
+            return
+          }
+          if (ch.gotResponse) return
           var seq = ch.requestSeq
           // Defer one tick so a SplitParser.onRead arriving with EOF wins cleanly.
           Qt.callLater(function() {
-            if (ch.busy && ch.requestSeq === seq && !sock.connected) ch.finish(false, "")
+            if (ch.busy && !ch.gotResponse && !ch.reconnecting && ch.requestSeq === seq && !sock.connected)
+              ch.finish(false, "")
           })
         }
       }
 
       onError: function() {
-        if (ch.busy) ch.finish(false, "")
+        if (!ch.busy || ch.reconnecting || ch.gotResponse) return
+        var seq = ch.requestSeq
+        // Defer so SplitParser.onRead wins on PeerClosedError EOF and Quickshell finishes unwinding.
+        Qt.callLater(function() {
+          if (ch.busy && !ch.gotResponse && !ch.reconnecting && ch.requestSeq === seq)
+            ch.finish(false, "")
+        })
       }
     }
   }
@@ -331,6 +439,7 @@ Item {
     }
     onFailed: {
       root.stateLoading = false
+      root.stateFailed()
       Qt.callLater(root._drainPendingStateFetch)
     }
   }
@@ -342,8 +451,12 @@ Item {
     onRawResponse: function(line) {
       root.libraryLoading = false
       root.libraryReceived(line)
+      Qt.callLater(root._drainPendingLibraryFetch)
     }
-    onFailed: root.libraryLoading = false
+    onFailed: {
+      root.libraryLoading = false
+      Qt.callLater(root._drainPendingLibraryFetch)
+    }
   }
 
   RpcChannel {
